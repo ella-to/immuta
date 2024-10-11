@@ -41,10 +41,10 @@ import (
 
 
 func main() {
-	log, err := immuta.New(immuta.WithFastWrite("./my.log"))
-	if err != nil {
-		panic(err)
-	}
+    log, err := immuta.New(immuta.WithFastWrite("./my.log"))
+    if err != nil {
+        panic(err)
+    }
     defer log.Close()
 
     content := []byte("hello world")
