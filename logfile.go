@@ -8,6 +8,10 @@ import (
 	"os"
 )
 
+var (
+	emptyHeader = make([]byte, HeaderSize)
+)
+
 // Appender is a single method interface that writes the content of the reader to the storage medium.
 type Appender interface {
 	// Append writes the content of the reader to the storage medium.
@@ -51,7 +55,7 @@ func (f *Storage) LastIndex() int64 {
 
 func (f *Storage) Append(r io.Reader) (size int64, err error) {
 	// Need to make space for the header
-	err = binary.Write(f.ref, binary.LittleEndian, size)
+	_, err = f.ref.Write(emptyHeader)
 	if err != nil {
 		return -1, err
 	}
@@ -178,10 +182,12 @@ func WithHighDurability(path string) StorageOpt {
 
 		// os.O_SYNC is enabled so every write operation will wait for the data
 		// to be fully committed to the storage medium before continuing.
-		ref, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_SYNC, 0644)
+		ref, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_SYNC, 0644)
 		if err != nil {
 			return err
 		}
+
+		s.ref = ref
 
 		// check the size of the file
 		stat, err := ref.Stat()
@@ -191,7 +197,11 @@ func WithHighDurability(path string) StorageOpt {
 
 		s.size = stat.Size()
 
-		s.ref = ref
+		_, err = ref.Seek(s.size, io.SeekStart)
+		if err != nil {
+			return err
+		}
+
 		return nil
 	})
 }
@@ -204,7 +214,7 @@ func WithFastWrite(path string) StorageOpt {
 			return fmt.Errorf("storage already created")
 		}
 
-		ref, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+		ref, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0644)
 		if err != nil {
 			return err
 		}
@@ -218,6 +228,11 @@ func WithFastWrite(path string) StorageOpt {
 		}
 
 		s.size = stat.Size()
+
+		_, err = ref.Seek(s.size, io.SeekStart)
+		if err != nil {
+			return err
+		}
 
 		return nil
 	})

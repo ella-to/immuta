@@ -3,6 +3,7 @@ package immuta_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -60,7 +61,7 @@ func TestFileAppendLog(t *testing.T) {
 	}
 
 	_, _, err = reader.Next()
-	if err != io.EOF {
+	if !errors.Is(err, io.EOF) {
 		t.Fatalf("err = %v, want EOF", err)
 	}
 }
@@ -158,5 +159,78 @@ func TestWithRelativeMessage(t *testing.T) {
 
 	if !bytes.Equal(buf.Bytes(), []byte("hello world 7")) {
 		t.Fatalf("content = %s, want hello world 7", buf.String())
+	}
+}
+
+func TestAddToExisitingLog(t *testing.T) {
+
+	content := []byte("hello world")
+
+	//
+	// Create a new file and write 10 messages
+	//
+
+	f, err := immuta.New(immuta.WithFastWrite("./TestAddToExisitingLog.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		os.Remove("./TestAddToExisitingLog.log")
+	})
+
+	for i := 0; i < 10; i++ {
+		_, err := f.Append(bytes.NewReader(content))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err = f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	//
+	// Reopen the file and write 10 more messages
+	//
+
+	f, err = immuta.New(immuta.WithFastWrite("./TestAddToExisitingLog.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 10; i++ {
+		_, err := f.Append(bytes.NewReader(content))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	//
+	// Read the messages back and check the content and count of messages
+	//
+
+	reader, err := f.Stream(context.TODO())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer reader.Done()
+
+	for i := 0; i < 20; i++ {
+		r, size, err := reader.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if size != 11 {
+			t.Fatalf("size = %d, want 11", size)
+		}
+
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(r)
+
+		if !bytes.Equal(buf.Bytes(), content) {
+			t.Fatalf("content = %s, want hello world", buf.String())
+		}
 	}
 }
