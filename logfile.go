@@ -5,7 +5,14 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+
+	"ella.to/solid"
+)
+
+const (
+	HeaderSize = 8
 )
 
 var (
@@ -16,75 +23,119 @@ var (
 type Appender interface {
 	// Append writes the content of the reader to the storage medium.
 	// and returns the size of the content written.
-	Append(r io.Reader) (size int64, err error)
+	Append(ctx context.Context, r io.Reader) (size int64, err error)
 }
 
 // Stream is an interface that deals with reading from the storage medium.
 type Stream interface {
 	// Creates a io.Reader and provide the size of the content ahead of time.
-	Next() (r io.Reader, size int64, err error)
+	// If there is no more content to read, it will blocked until there is more content or the context is done.
+	Next(ctx context.Context) (r io.Reader, size int64, err error)
 	// Done should be called to release the reader.
 	// the best practice is once an stream is created successfully, call Done in defer.
 	Done()
 }
 
-// HeaderSize is the size of the header that is written before the content.
-// Currently the header is 8 bytes long and contains the size of the content.
-// However it most cases we don't need that much spaces, the ramining space can be used/reserved
-// for other purposes in the future
-const HeaderSize = 8
+//
+// Storage
+//
 
 type Storage struct {
-	ref       *os.File
-	size      int64
-	lastIndex int64
-	streams   chan *fileReader
+	w         *os.File
+	fds       chan *os.File
+	bc        *solid.Broadcast
+	currSize  int64
+	currCount int64
 }
 
 var _ Appender = (*Storage)(nil)
 
-// Size returns the size of the storage medium.
-func (f *Storage) Size() int64 {
-	return f.size
+func (s *Storage) getFd(ctx context.Context) (*os.File, error) {
+	select {
+	case fd, ok := <-s.fds:
+		if !ok {
+			return nil, fmt.Errorf("no more file descriptors")
+		}
+		return fd, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
-// LastIndex returns the last index written to the storage medium.
-func (f *Storage) LastIndex() int64 {
-	return f.lastIndex
+func (s *Storage) putFd(ctx context.Context, fd *os.File) error {
+	select {
+	case s.fds <- fd:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
-func (f *Storage) Append(r io.Reader) (size int64, err error) {
-	// Need to make space for the header
-	_, err = f.ref.Write(emptyHeader)
+func (s *Storage) Append(ctx context.Context, r io.Reader) (size int64, err error) {
+	defer func() {
+		var shouldSignal bool
+
+		// if there is an error, move the current position back to the original position
+		if err == nil {
+			s.currSize += size + HeaderSize
+			s.currCount++
+
+			_, err = s.w.Seek(0, io.SeekStart)
+			if err != nil {
+				slog.Error("failed to seek to the beginning of the file", "err", err)
+			} else {
+				err = binary.Write(s.w, binary.LittleEndian, s.currCount)
+				if err != nil {
+					slog.Error("failed to write the size of the content", "err", err)
+				} else {
+					shouldSignal = true
+				}
+			}
+
+			if shouldSignal {
+				s.bc.Notify()
+			}
+
+		} else {
+			// truncate the file to the original size
+			err = s.w.Truncate(s.currSize)
+			if err != nil {
+				slog.Error("failed to truncate the file", "err", err, "size", s.currSize)
+			}
+		}
+	}()
+
+	_, err = s.w.Seek(s.currSize, io.SeekStart)
 	if err != nil {
 		return -1, err
 	}
 
-	f.lastIndex = f.size
-
-	f.size += HeaderSize
-
-	// copy the data and record the size
-	size, err = io.Copy(f.ref, r)
+	// write header first
+	//
+	_, err = s.w.Write(emptyHeader)
 	if err != nil {
 		return -1, err
 	}
 
-	f.size += size
-
-	// Move back to the header and write the size
-	_, err = f.ref.Seek(f.size-(size+HeaderSize), io.SeekStart)
+	// copy the content
+	//
+	size, err = io.Copy(s.w, r)
 	if err != nil {
 		return -1, err
 	}
 
-	err = binary.Write(f.ref, binary.LittleEndian, size)
+	currSize := s.currSize + size + HeaderSize
+
+	// Move back to the header of the content
+	//
+	_, err = s.w.Seek(currSize-(size+HeaderSize), io.SeekStart)
 	if err != nil {
 		return -1, err
 	}
 
-	// Move to the end of the file
-	_, err = f.ref.Seek(f.size, io.SeekStart)
+	// write the size of the content
+	//
+	err = binary.Write(s.w, binary.LittleEndian, size)
 	if err != nil {
 		return -1, err
 	}
@@ -92,247 +143,225 @@ func (f *Storage) Append(r io.Reader) (size int64, err error) {
 	return size, nil
 }
 
-// Stream creates a reader that reads from the storage medium starting from the index.
-// Each object is independent and can be read in any order, multiple readers doesn't affect each other.
-// In order to protect the OS from running out of file descriptors, there is a semaphore that limits the number of readers.
-// if the semaphore is full, the call will block until a reader is available.
-// once the reader is used, Done should be called to release the reader.
-// if no options are provided, the reader will start from the beginning of the storage medium.
-func (f *Storage) Stream(ctx context.Context, opts ...StreamOpt) (Stream, error) {
-	var stream *fileReader
-
-	select {
-	case stream = <-f.streams:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-
-	_, err := stream.ref.Seek(0, io.SeekStart)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, opt := range opts {
-		if err := opt.configureStream(stream); err != nil {
-			return nil, err
-		}
-	}
-
-	return stream, nil
-}
-
-// Close will close all the streams and the storage medium.
-// it will wait for all the streams to be closed before closing the storage medium.
-func (f *Storage) Close() error {
-	// try to close all the streams first,
-	for range cap(f.streams) {
-		stream := <-f.streams
-		err := stream.ref.Close()
-		if err != nil {
+func (s *Storage) Close() error {
+	for range cap(s.fds) {
+		fd := <-s.fds
+		if err := fd.Close(); err != nil {
 			return err
 		}
 	}
-
-	return f.ref.Close()
+	return s.w.Close()
 }
 
-func (f *Storage) stream(index int64) (*fileReader, error) {
-	ref, err := os.Open(f.ref.Name())
+func (s *Storage) getIndexFromPos(ctx context.Context, startPos int64) (int64, error) {
+	fd, err := s.getFd(ctx)
+	if err != nil {
+		return -1, err
+	}
+	defer s.putFd(context.WithoutCancel(ctx), fd)
+
+	fd.Seek(0, io.SeekStart)
+
+	var total int64
+	err = binary.Read(fd, binary.LittleEndian, &total)
+	if err != nil {
+		return -1, err
+	}
+
+	if startPos < 0 || total-startPos <= 0 {
+		stat, err := fd.Stat()
+		if err != nil {
+			return -1, err
+		}
+		return stat.Size(), nil
+	}
+
+	var index int64 = HeaderSize
+
+	for range startPos {
+		var size int64
+		err = binary.Read(fd, binary.LittleEndian, &size)
+		if err != nil {
+			return -1, err
+		}
+
+		_, err = fd.Seek(size, io.SeekCurrent)
+		if err != nil {
+			return -1, err
+		}
+
+		index += size + HeaderSize
+	}
+
+	return index, nil
+}
+
+// Stream(ctx, 0) 	-> from the beginning
+// Stream(ctx, -1) 	-> start from latest messages
+// Stream(ctx, 10) 	-> start after 10nth message
+func (s *Storage) Stream(ctx context.Context, startPos int64) (Stream, error) {
+	index, err := s.getIndexFromPos(ctx, startPos)
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = ref.Seek(index, io.SeekStart)
-	if err != nil {
-		return nil, err
-	}
-
-	return &fileReader{
-		ref: ref,
+	return &stream{
+		index:  index,
+		getFd:  s.getFd,
+		putFd:  s.putFd,
+		signal: s.bc.CreateSignal(solid.WithHistory(startPos)),
 	}, nil
 }
 
-type StorageOpt interface {
-	configureStorage(*Storage) error
-}
-
-type storageOptFunc func(*Storage) error
-
-func (f storageOptFunc) configureStorage(s *Storage) error {
-	return f(s)
-}
-
-type StreamOpt interface {
-	configureStream(*fileReader) error
-}
-
-type streamOptFunc func(*fileReader) error
-
-func (f streamOptFunc) configureStream(s *fileReader) error {
-	return f(s)
-}
-
-// WithHighDurability will wait for the data to be fully committed to the storage medium.
-// it is slower than WithFastWrite, usually 12-13 times slower.
-func WithHighDurability(path string) StorageOpt {
-	return storageOptFunc(func(s *Storage) error {
-		if s.ref != nil {
-			return fmt.Errorf("storage already created")
-		}
-
-		// os.O_SYNC is enabled so every write operation will wait for the data
-		// to be fully committed to the storage medium before continuing.
-		ref, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_SYNC, 0644)
-		if err != nil {
-			return err
-		}
-
-		s.ref = ref
-
-		// check the size of the file
-		stat, err := ref.Stat()
-		if err != nil {
-			return err
-		}
-
-		s.size = stat.Size()
-
-		_, err = ref.Seek(s.size, io.SeekStart)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
-}
-
-// WithFastWrite will not wait for the data to be fully committed to the storage medium.
-// it usually 12-13 times faster than WithHighDurability.
-func WithFastWrite(path string) StorageOpt {
-	return storageOptFunc(func(s *Storage) error {
-		if s.ref != nil {
-			return fmt.Errorf("storage already created")
-		}
-
-		ref, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0644)
-		if err != nil {
-			return err
-		}
-
-		s.ref = ref
-
-		// check the size of the file
-		stat, err := ref.Stat()
-		if err != nil {
-			return err
-		}
-
-		s.size = stat.Size()
-
-		_, err = ref.Seek(s.size, io.SeekStart)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
-}
-
-// WithAbsolutePosition will start reading from the index.
-// this is useful when you want to keep track of the last read index and start reading from that index.
-// make sure to keep track of the size of Header which is 8 bytes
-// Recommended to use WithMessageIdx instead.
-func WithAbsolutePosition(idx int64) StreamOpt {
-	return streamOptFunc(func(s *fileReader) error {
-		_, err := s.ref.Seek(idx, io.SeekStart)
-		return err
-	})
-}
-
-// WithRelativeMessage will skip the first count number of messages.
-// this is useful when you want to start reading from a specific message.
-func WithRelativeMessage(count int64) StreamOpt {
-	return streamOptFunc(func(s *fileReader) error {
-		var size int64
-
-		for range count {
-			err := binary.Read(s.ref, binary.LittleEndian, &size)
-			if err != nil {
-				return err
-			}
-
-			_, err = s.ref.Seek(size, io.SeekCurrent)
-			if err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
-}
-
-// In order to protect the OS from running out of file descriptors, there is a semaphore that limits the number of readers.
-// this will set the size of the semaphore and the number of readers that can be created. the default is 10.
-func WithQueueSize(size int) StorageOpt {
-	return storageOptFunc(func(s *Storage) error {
-		if s.streams != nil {
-			return fmt.Errorf("storage already created")
-		}
-
-		s.streams = make(chan *fileReader, size)
-
-		return nil
-	})
-}
-
-// New creates a new storage medium that writes to the file specified by the path.
-// The storage medium can be configured with options.
-func New(opts ...StorageOpt) (*Storage, error) {
-	if opts == nil {
-		return nil, fmt.Errorf("no options provided")
+func New(filepath string, readerCount int, fastWrite bool) (*Storage, error) {
+	if readerCount <= 0 {
+		return nil, fmt.Errorf("readerCount must be greater than 0")
 	}
 
-	s := &Storage{}
+	var flag int
 
-	for _, opt := range opts {
-		err := opt.configureStorage(s)
-		if err != nil {
-			return nil, err
-		}
+	if fastWrite {
+		flag = os.O_RDWR | os.O_CREATE
+	} else {
+		flag = os.O_RDWR | os.O_CREATE | os.O_SYNC
 	}
 
-	if s.streams == nil {
-		s.streams = make(chan *fileReader, 10)
-	}
-
-	for range cap(s.streams) {
-		stream, err := s.stream(0)
-		if err != nil {
-			return nil, err
-		}
-		stream.done = s.streams
-		s.streams <- stream
-	}
-
-	return s, nil
-}
-
-type fileReader struct {
-	ref  *os.File
-	done chan<- *fileReader
-}
-
-var _ Stream = (*fileReader)(nil)
-
-func (f *fileReader) Next() (r io.Reader, size int64, err error) {
-	err = binary.Read(f.ref, binary.LittleEndian, &size)
+	w, err := os.OpenFile(filepath, flag, 0644)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 
-	return io.LimitReader(f.ref, size), size, nil
+	size, err := getSize(w)
+	if err != nil {
+		return nil, err
+	}
+
+	if size == 0 {
+		_, err = w.Write(emptyHeader)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	_, err = w.Seek(0, io.SeekStart)
+	if err != nil {
+		return nil, err
+	}
+
+	//
+	// read the first 8 bytes to get the number of messages
+	//
+
+	var count int64
+	err = binary.Read(w, binary.LittleEndian, &count)
+	if err != nil {
+		return nil, err
+	}
+
+	// move the cursor to the end of the file
+
+	size, err = getSize(w)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = w.Seek(size, io.SeekStart)
+	if err != nil {
+		return nil, err
+	}
+
+	storage := &Storage{
+		w:         w,
+		fds:       make(chan *os.File, readerCount),
+		bc:        solid.NewBroadcast(),
+		currSize:  size,
+		currCount: count,
+	}
+
+	for i := 0; i < readerCount; i++ {
+		fd, err := os.Open(filepath)
+		if err != nil {
+			return nil, err
+		}
+		storage.fds <- fd
+	}
+
+	return storage, nil
 }
 
-func (f *fileReader) Done() {
-	f.done <- f
+func getSize(w *os.File) (int64, error) {
+	stat, err := w.Stat()
+	if err != nil {
+		return -1, err
+	}
+	return stat.Size(), nil
+}
+
+//
+// stream
+//
+
+type stream struct {
+	index  int64
+	getFd  func(context.Context) (*os.File, error)
+	putFd  func(context.Context, *os.File) error
+	signal *solid.Signal
+}
+
+var _ Stream = (*stream)(nil)
+
+func (s *stream) Next(ctx context.Context) (r io.Reader, size int64, err error) {
+	err = s.signal.Wait(ctx)
+	if err != nil {
+		return nil, -1, err
+	}
+
+	fd, err := s.getFd(ctx)
+	if err != nil {
+		return nil, -1, err
+	}
+
+	_, err = fd.Seek(s.index, io.SeekStart)
+	if err != nil {
+		return nil, -1, err
+	}
+
+	err = binary.Read(fd, binary.LittleEndian, &size)
+	if err != nil {
+		return nil, -1, err
+	}
+
+	return &reader{
+		r: io.LimitReader(fd, size),
+		done: func() {
+			s.index += size + HeaderSize
+			err = s.putFd(ctx, fd)
+			if err != nil {
+				slog.Error("failed to return the file descriptor back to the pool", "err", err)
+			}
+		},
+	}, size, nil
+}
+
+func (s *stream) Done() {
+	s.signal.Done()
+}
+
+//
+// reader
+//
+
+type reader struct {
+	r    io.Reader
+	done func()
+}
+
+var _ io.Reader = (*reader)(nil)
+
+func (r *reader) Read(p []byte) (n int, err error) {
+	n, err = r.r.Read(p)
+	if err != nil {
+		r.done()
+	}
+	return
 }

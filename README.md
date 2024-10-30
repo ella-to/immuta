@@ -7,18 +7,20 @@
 ╚═╝╚═╝░░░░░╚═╝╚═╝░░░░░╚═╝░╚═════╝░░░░╚═╝░░░╚═╝░░╚═╝
 ```
 
-Immuta is a `Append Only Log` implementation based on single writer, multiple readers concept. It uses filesystem as it's core the format of the each record is as follows
+Immuta is a `Append Only Log` implementation based on single writer, multiple readers concept. It uses filesystem as it's core the format of the each record is as follows and uses [solid](https://ella.to/solid) for io signgling
 
-- the first 8 bytes define the size of the payload (Header)
-- payload can be any arbitrary size
-- records are one after another
+- the first 8 bytes provide the number of messages in the log file
+- loop
+  - the next 8 bytes define the size of the payload (Header)
+  - payload can be any arbitrary size
 
 ```
-+----------+---------------+----------+---------------+
-|          |               |          |               |
-|  HEADER  |    PAYLOAD    |  HEADER  |    PAYLOAD    | ...
-|          |               |          |               |
-+----------+---------------+----------+---------------+
++----------+----------+---------------+----------+---------------+
+|          |          |               |          |               |
+| MESSAGES |  PAYLOAD |    PAYLOAD    |  PAYLOAD |    PAYLOAD    | ...
+|   COUNT  |   SIZE   |               |   SIZE   |               |
++----------+----------+---------------+----------+---------------+
+   8 bytes   8 bytes                    8 bytes
 ```
 
 # Installation
@@ -30,58 +32,110 @@ go get ella.to/immuta
 # Usgae
 
 ```golang
+package main
 
 import (
-    "bytes"
-    "io"
-    "fmt"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"time"
 
-    "ella.to/immuta"
+	"ella.to/immuta"
 )
 
-
 func main() {
-    log, err := immuta.New(immuta.WithFastWrite("./my.log"))
-    if err != nil {
-        panic(err)
-    }
-    defer log.Close()
+	filename := "./data.log"
+	poolFileDescriptor := 10
+	// fastwrite uses the buffer for each append
+	// if you need gurrantee on saving on disk, enable set fastWrite to false
+	// the Append operation will get the performance hit
+	fastWrite := true
 
-    content := []byte("hello world")
+	log, err := immuta.New(filename, poolFileDescriptor, fastWrite)
+	if err != nil {
+		panic(err)
+	}
+	defer log.Close()
 
-    // write to append only log
-    size, err := log.Append(bytes.NewReader(content))
-    if err != nil {
-        panic(err)
-    }
+	content := []byte("hello world")
 
-    if size != 11 {
-        panic("size must be 11")
-    }
+	// write to append only log
+	size, err := log.Append(context.Background(), bytes.NewReader(content))
+	if err != nil {
+		panic(err)
+	}
 
-    // for reading, create a stream
-    reader, err := log.Stream(context.TODO(), 0)
-    if err != nil {
-        panic(err)
-    }
-    // make sure to signal immuta that you have done reading
-    // so the resoucre can be reused again
-    defer reader.Done()
+	if size != 11 {
+		panic("size must be 11")
+	}
 
-    for {
-        r, size, err := reader.Next()
-        if errors.Is(err, io.EOF) {
-            break
-        }
+	// 0: start from beginning
+	// negative value: start from latest append
+	// positive number: skip those message
+	var startPos int64 = 0
 
-        data, err := io.ReadAll(r)
-        if err != nil {
-            panic(err)
-        }
+	// this call doesn't allocate any file descriptor yet
+	stream, err := log.Stream(context.Background(), startPos)
+	if err != nil {
+		panic(err)
+	}
+	defer stream.Done()
 
-        // you should see on screen
-        // Data is: hello world, with size of 11
-        fmt.Printf("Data is: %s, with size of %d", string(data), size)
-    }
+	for {
+		var buffer bytes.Buffer
+
+		err := func() error {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			r, size, err := stream.Next(ctx)
+			if err != nil {
+				return err
+			}
+
+			buffer.Reset()
+
+			_, err = io.Copy(&buffer, r)
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("size of the record: %d\n", size)
+			fmt.Printf("content: %s\n", buffer.String())
+
+			return nil
+		}()
+
+		if errors.Is(err, context.DeadlineExceeded) {
+			break
+		} else if err != nil {
+			panic(err)
+		}
+	}
 }
+```
+
+# Performance
+
+- Appending 100k records of 1kb took around 1 seconds
+
+```
+go test -benchmem -run=^$ -bench ^Benchmark1kbAppend$ ella.to/immuta
+
+goos: darwin
+goarch: arm64
+pkg: ella.to/immuta
+cpu: Apple M2 Pro
+Benchmark1kbAppend-12    	  108162	      9842 ns/op	      64 B/op	       3 allocs/op
+```
+
+- Reading the 100k record is under 150ms
+
+```
+go test -timeout 30s -run ^TestRead100kMessages$ ella.to/immuta -v
+=== RUN   TestRead100kMessages
+time taken to write 100000: 911.729167ms
+time taken to read 100000: 139.258583ms
 ```
