@@ -3,6 +3,7 @@ package immuta_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -59,6 +60,7 @@ func TestBasicUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read content: %v", err)
 	}
+	defer r.Done()
 
 	if size != int64(len(content)) {
 		t.Fatalf("expected size to be %d, got %d", len(content), size)
@@ -104,25 +106,28 @@ func TestSingleWriteSingleReader(t *testing.T) {
 		defer stream.Done()
 
 		for i := 0; i < messagesCount; i++ {
-			expectedContent := fmt.Sprintf("hello world %d", i)
+			func() {
+				expectedContent := fmt.Sprintf("hello world %d", i)
 
-			r, size, err := stream.Next(context.Background())
-			if err != nil {
-				t.Errorf("failed to read content: %v", err)
-			}
+				r, size, err := stream.Next(context.Background())
+				if err != nil {
+					t.Errorf("failed to read content: %v", err)
+				}
+				defer r.Done()
 
-			buf := new(bytes.Buffer)
-			if _, err := buf.ReadFrom(r); err != nil {
-				t.Errorf("failed to read content: %v", err)
-			}
+				buf := new(bytes.Buffer)
+				if _, err := buf.ReadFrom(r); err != nil {
+					t.Errorf("failed to read content: %v", err)
+				}
 
-			if size != int64(len(expectedContent)) {
-				t.Errorf("expected size to be %d, got %d", len(expectedContent), size)
-			}
+				if size != int64(len(expectedContent)) {
+					t.Errorf("expected size to be %d, got %d", len(expectedContent), size)
+				}
 
-			if buf.String() != expectedContent {
-				t.Errorf("expected content to be %v, got %v", expectedContent, buf.String())
-			}
+				if buf.String() != expectedContent {
+					t.Errorf("expected content to be %v, got %v", expectedContent, buf.String())
+				}
+			}()
 		}
 	}()
 
@@ -162,6 +167,7 @@ func TestSkipNMessages(t *testing.T) {
 				t.Fatalf("failed to read content: %v", err)
 				return false
 			}
+			defer r.Done()
 
 			buf := new(bytes.Buffer)
 			if _, err := buf.ReadFrom(r); err != nil {
@@ -247,8 +253,6 @@ func TestSingleWriteMultipleReader(t *testing.T) {
 
 			stream := storage.Stream(context.Background(), 0)
 
-			fmt.Println("stream created:", stream)
-
 			count := 0
 			for {
 				ok := func() bool {
@@ -262,6 +266,7 @@ func TestSingleWriteMultipleReader(t *testing.T) {
 						t.Errorf("failed to read content: %v", err)
 						return false
 					}
+					defer r.Done()
 
 					buf := new(bytes.Buffer)
 					if _, err := buf.ReadFrom(r); err != nil {
@@ -352,25 +357,15 @@ func TestRead100kMessages(t *testing.T) {
 	}()
 
 	for i := 0; i < n; i++ {
-		r, _, err := stream.Next(context.Background())
-		if err != nil {
-			t.Fatalf("failed to read content: %v", err)
-		}
+		func() {
+			r, _, err := stream.Next(context.Background())
+			if err != nil {
+				t.Fatalf("failed to read content: %v", err)
+			}
+			defer r.Done()
 
-		io.Copy(io.Discard, r)
-
-		// buf := new(bytes.Buffer)
-		// if _, err := buf.ReadFrom(r); err != nil {
-		// 	t.Fatalf("failed to read content: %v", err)
-		// }
-
-		// if size != int64(len(content)) {
-		// 	t.Fatalf("expected size to be %d, got %d", len(content), size)
-		// }
-
-		// if !bytes.Equal(buf.Bytes(), content) {
-		// 	t.Fatalf("expected content to be %v, got %v", content, buf.Bytes())
-		// }
+			io.Copy(io.Discard, r)
+		}()
 	}
 }
 
@@ -406,32 +401,67 @@ func TestSequence(t *testing.T) {
 			defer stream.Done()
 
 			for i := 0; i < n; i++ {
-				expectedContent := fmt.Sprintf("hello world %d", i)
 
-				r, size, err := stream.Next(context.Background())
-				if err != nil {
-					t.Errorf("failed to read content: %v", err)
-					return
-				}
+				func() {
+					expectedContent := fmt.Sprintf("hello world %d", i)
 
-				buf := new(bytes.Buffer)
-				if _, err := buf.ReadFrom(r); err != nil {
-					t.Errorf("failed to read content: %v", err)
-					return
-				}
+					r, size, err := stream.Next(context.Background())
+					if err != nil {
+						t.Errorf("failed to read content: %v", err)
+						return
+					}
+					defer r.Done()
 
-				if size != int64(len(expectedContent)) {
-					t.Errorf("expected size to be %d, got %d", len(expectedContent), size)
-					return
-				}
+					buf := new(bytes.Buffer)
+					if _, err := buf.ReadFrom(r); err != nil {
+						t.Errorf("failed to read content: %v", err)
+						return
+					}
 
-				if buf.String() != fmt.Sprintf("hello world %d", i) {
-					t.Errorf("expected content to be %v, got %v", expectedContent, buf.String())
-					return
-				}
+					if size != int64(len(expectedContent)) {
+						t.Errorf("expected size to be %d, got %d", len(expectedContent), size)
+						return
+					}
+
+					if buf.String() != fmt.Sprintf("hello world %d", i) {
+						t.Errorf("expected content to be %v, got %v", expectedContent, buf.String())
+						return
+					}
+				}()
 			}
 		}()
 	}
 
 	wg.Wait()
+}
+
+func TestJson(t *testing.T) {
+	t.Parallel()
+
+	storage, cleanup := createStorage(t, "./TestJson.log")
+	defer cleanup()
+
+	_, _, err := storage.Append(context.Background(), strings.NewReader(`{"id":0,"name":"hello world 0"}`))
+	if err != nil {
+		t.Fatalf("failed to append content: %v", err)
+	}
+
+	stream := storage.Stream(context.Background(), 0)
+	defer stream.Done()
+
+	r, _, err := stream.Next(context.Background())
+	if err != nil {
+		t.Fatalf("failed to read content: %v", err)
+	}
+	defer r.Done()
+
+	var m map[string]interface{}
+	err = json.NewDecoder(r).Decode(&m)
+	if err != nil {
+		t.Fatalf("failed to decode json: %v", err)
+	}
+
+	if m == nil {
+		t.Fatalf("expected map to be non-nil")
+	}
 }
