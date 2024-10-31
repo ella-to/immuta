@@ -32,7 +32,7 @@ type Appender interface {
 type Stream interface {
 	// Creates a io.Reader and provide the size of the content ahead of time.
 	// If there is no more content to read, it will blocked until there is more content or the context is done.
-	Next(ctx context.Context) (r io.Reader, size int64, err error)
+	Next(ctx context.Context) (r *Reader, size int64, err error)
 	// Done should be called to release the reader.
 	// the best practice is once an stream is created successfully, call Done in defer.
 	Done()
@@ -378,7 +378,7 @@ func (s *stream) findIndex(fd *os.File) (int64, error) {
 	return index, nil
 }
 
-func (s *stream) Next(ctx context.Context) (r io.Reader, size int64, err error) {
+func (s *stream) Next(ctx context.Context) (r *Reader, size int64, err error) {
 CHECK:
 	err = s.signal.Wait(ctx)
 	if err != nil {
@@ -419,14 +419,11 @@ CHECK:
 		return nil, -1, fmt.Errorf("failed to read size of content at %d, id: %d: %w", s.index, s.id, err)
 	}
 
-	return &reader{
+	return &Reader{
 		r: io.LimitReader(fd, size),
-		done: func() {
+		done: func() error {
 			s.index += size + HeaderSize
-			err = s.putFd(ctx, fd)
-			if err != nil {
-				slog.Error("failed to return the file descriptor back to the pool", "err", err)
-			}
+			return s.putFd(ctx, fd)
 		},
 	}, size, nil
 }
@@ -439,17 +436,17 @@ func (s *stream) Done() {
 // reader
 //
 
-type reader struct {
+type Reader struct {
 	r    io.Reader
-	done func()
+	done func() error
 }
 
-var _ io.Reader = (*reader)(nil)
+var _ io.Reader = (*Reader)(nil)
 
-func (r *reader) Read(p []byte) (n int, err error) {
-	n, err = r.r.Read(p)
-	if err != nil {
-		r.done()
-	}
-	return
+func (r *Reader) Read(p []byte) (n int, err error) {
+	return r.r.Read(p)
+}
+
+func (r *Reader) Done() error {
+	return r.done()
 }

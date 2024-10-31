@@ -95,6 +95,8 @@ func main() {
 			if err != nil {
 				return err
 			}
+			// important: don't forget to call Done() to release the file descriptor
+			defer r.Done()
 
 			buffer.Reset()
 
