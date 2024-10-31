@@ -373,3 +373,65 @@ func TestRead100kMessages(t *testing.T) {
 		// }
 	}
 }
+
+func TestSequence(t *testing.T) {
+	t.Parallel()
+
+	storage, cleanup := createStorage(t, "./TestSequence.log")
+	defer cleanup()
+
+	n := 10
+	c := 2
+
+	var wg sync.WaitGroup
+
+	wg.Add(c + 1)
+
+	go func() {
+		defer wg.Done()
+		for i := range n {
+			r := strings.NewReader(fmt.Sprintf("hello world %d", i))
+			_, _, err := storage.Append(context.Background(), r)
+			if err != nil {
+				t.Errorf("failed to append content: %v", err)
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < c; i++ {
+		go func() {
+			defer wg.Done()
+			stream := storage.Stream(context.Background(), 0)
+			defer stream.Done()
+
+			for i := 0; i < n; i++ {
+				expectedContent := fmt.Sprintf("hello world %d", i)
+
+				r, size, err := stream.Next(context.Background())
+				if err != nil {
+					t.Errorf("failed to read content: %v", err)
+					return
+				}
+
+				buf := new(bytes.Buffer)
+				if _, err := buf.ReadFrom(r); err != nil {
+					t.Errorf("failed to read content: %v", err)
+					return
+				}
+
+				if size != int64(len(expectedContent)) {
+					t.Errorf("expected size to be %d, got %d", len(expectedContent), size)
+					return
+				}
+
+				if buf.String() != fmt.Sprintf("hello world %d", i) {
+					t.Errorf("expected content to be %v, got %v", expectedContent, buf.String())
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+}
