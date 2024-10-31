@@ -62,9 +62,13 @@ func main() {
 	content := []byte("hello world")
 
 	// write to append only log
-	size, err := log.Append(context.Background(), bytes.NewReader(content))
+	index, size, err := log.Append(context.Background(), bytes.NewReader(content))
 	if err != nil {
 		panic(err)
+	}
+
+	if index != 8 {
+		panic("index must be 8")
 	}
 
 	if size != 11 {
@@ -77,10 +81,7 @@ func main() {
 	var startPos int64 = 0
 
 	// this call doesn't allocate any file descriptor yet
-	stream, err := log.Stream(context.Background(), startPos)
-	if err != nil {
-		panic(err)
-	}
+	stream := log.Stream(context.Background(), startPos)
 	defer stream.Done()
 
 	for {
@@ -128,7 +129,7 @@ goos: darwin
 goarch: arm64
 pkg: ella.to/immuta
 cpu: Apple M2 Pro
-Benchmark1kbAppend-12    	  108162	      9842 ns/op	      64 B/op	       3 allocs/op
+Benchmark1kbAppend-12             103730              9882 ns/op              64 B/op          3 allocs/op
 ```
 
 - Reading the 100k record is under 150ms
@@ -136,6 +137,6 @@ Benchmark1kbAppend-12    	  108162	      9842 ns/op	      64 B/op	       3 alloc
 ```
 go test -timeout 30s -run ^TestRead100kMessages$ ella.to/immuta -v
 === RUN   TestRead100kMessages
-time taken to write 100000: 911.729167ms
-time taken to read 100000: 139.258583ms
+time taken to write 100000: 895.478792ms
+time taken to read 100000: 139.394542ms
 ```
