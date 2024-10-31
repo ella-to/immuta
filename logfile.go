@@ -390,6 +390,15 @@ CHECK:
 		return nil, -1, err
 	}
 
+	defer func() {
+		if err != nil {
+			err = s.putFd(ctx, fd)
+			if err != nil {
+				slog.Error("failed to return the file descriptor back to the pool", "err", err)
+			}
+		}
+	}()
+
 	if s.index == -1 {
 		s.index, err = s.findIndex(fd)
 		if err != nil {
