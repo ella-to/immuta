@@ -28,9 +28,13 @@ func main() {
 	content := []byte("hello world")
 
 	// write to append only log
-	size, err := log.Append(context.Background(), bytes.NewReader(content))
+	index, size, err := log.Append(context.Background(), bytes.NewReader(content))
 	if err != nil {
 		panic(err)
+	}
+
+	if index != 8 {
+		panic("index must be 8")
 	}
 
 	if size != 11 {
