@@ -47,10 +47,7 @@ func main() {
 	var startPos int64 = 0
 
 	// this call doesn't allocate any file descriptor yet
-	stream, err := log.Stream(context.Background(), startPos)
-	if err != nil {
-		panic(err)
-	}
+	stream := log.Stream(context.Background(), startPos)
 	defer stream.Done()
 
 	for {
