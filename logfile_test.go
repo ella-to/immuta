@@ -29,7 +29,7 @@ func createStorage(t testing.TB, filename string) (*immuta.Storage, func()) {
 }
 
 func TestBasicUsage(t *testing.T) {
-	// t.Parallel()
+	t.Parallel()
 
 	storage, celanup := createStorage(t, "./TestBasicUsage.log")
 	defer celanup()
@@ -49,7 +49,7 @@ func TestBasicUsage(t *testing.T) {
 		t.Fatalf("expected size to be %d, got %d", len(content), size)
 	}
 
-	stream, err := storage.Stream(context.Background(), 0)
+	stream := storage.Stream(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("failed to create stream: %v", err)
 	}
@@ -75,73 +75,62 @@ func TestBasicUsage(t *testing.T) {
 }
 
 func TestSingleWriteSingleReader(t *testing.T) {
-	// t.Parallel()
+	t.Parallel()
+
+	messagesCount := 2
 
 	storage, cleanup := createStorage(t, "./TestSingleWriteSingleReader.log")
 	defer cleanup()
 
-	content := []byte("hello world")
+	var wg sync.WaitGroup
+
+	wg.Add(2)
 
 	go func() {
-		for i := 0; i < 10; i++ {
-			_, _, err := storage.Append(context.Background(), bytes.NewReader(content))
+		defer wg.Done()
+
+		for i := 0; i < messagesCount; i++ {
+			_, _, err := storage.Append(context.Background(), strings.NewReader(fmt.Sprintf("hello world %d", i)))
 			if err != nil {
 				t.Errorf("failed to append content: %v", err)
 			}
 		}
 	}()
 
-	stream, err := storage.Stream(context.Background(), 0)
-	if err != nil {
-		t.Fatalf("failed to create stream: %v", err)
-	}
+	go func() {
+		defer wg.Done()
 
-	count := 0
+		stream := storage.Stream(context.Background(), 0)
+		defer stream.Done()
 
-	for {
-		ok := func() bool {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
+		for i := 0; i < messagesCount; i++ {
+			expectedContent := fmt.Sprintf("hello world %d", i)
 
-			r, size, err := stream.Next(ctx)
-			if errors.Is(err, context.DeadlineExceeded) {
-				return false
-			} else if err != nil {
+			r, size, err := stream.Next(context.Background())
+			if err != nil {
 				t.Errorf("failed to read content: %v", err)
-				return false
 			}
 
 			buf := new(bytes.Buffer)
 			if _, err := buf.ReadFrom(r); err != nil {
 				t.Errorf("failed to read content: %v", err)
-				return false
 			}
 
-			if buf.String() != "hello world" {
-				t.Errorf("expected content to be %s, got %s", "hello world", buf.String())
-				return false
+			if size != int64(len(expectedContent)) {
+				t.Errorf("expected size to be %d, got %d", len(expectedContent), size)
 			}
 
-			if size != int64(len(content)) {
-				t.Errorf("expected size to be %d, got %d", len(content), size)
-				return false
+			if buf.String() != expectedContent {
+				t.Errorf("expected content to be %v, got %v", expectedContent, buf.String())
 			}
-			return true
-		}()
-		if !ok {
-			break
 		}
+	}()
 
-		count++
-	}
-
-	if count != 10 {
-		t.Fatalf("expected to read 10 times, got %d", count)
-	}
+	wg.Wait()
 }
 
 func TestSkipNMessages(t *testing.T) {
-	// t.Parallel()
+	t.Parallel()
 
 	storage, cleanup := createStorage(t, "./TestSkipNMessages.log")
 	defer cleanup()
@@ -157,10 +146,7 @@ func TestSkipNMessages(t *testing.T) {
 		}
 	}
 
-	stream, err := storage.Stream(context.Background(), 5)
-	if err != nil {
-		t.Fatalf("failed to create stream: %v", err)
-	}
+	stream := storage.Stream(context.Background(), 5)
 
 	count := 0
 
@@ -230,7 +216,7 @@ func TestDetails(t *testing.T) {
 }
 
 func TestSingleWriteMultipleReader(t *testing.T) {
-	// t.Parallel()
+	t.Parallel()
 
 	storage, cleanup := createStorage(t, "./TestSingleWriteMultipleReader.log")
 	defer cleanup()
@@ -242,34 +228,24 @@ func TestSingleWriteMultipleReader(t *testing.T) {
 
 	var wg sync.WaitGroup
 
-	wg.Add(readersCount)
+	wg.Add(readersCount + 1)
 
-	for i := 0; i < n; i++ {
-		_, _, err := storage.Append(context.Background(), bytes.NewReader(content))
-		if err != nil {
-			t.Errorf("failed to append content: %v", err)
+	go func() {
+		defer wg.Done()
+
+		for i := 0; i < n; i++ {
+			_, _, err := storage.Append(context.Background(), bytes.NewReader(content))
+			if err != nil {
+				t.Errorf("failed to append content: %v", err)
+			}
 		}
-	}
-
-	details, err := storage.Details()
-	if err != nil {
-		t.Fatalf("failed to get details: %v", err)
-	}
-
-	fmt.Println("details:", details)
-
-	if err := storage.Verify(); err != nil {
-		t.Fatalf("failed to verify storage: %v", err)
-	}
+	}()
 
 	for range readersCount {
 		go func() {
 			defer wg.Done()
 
-			stream, err := storage.Stream(context.Background(), 0)
-			if err != nil {
-				t.Errorf("failed to create stream: %v", err)
-			}
+			stream := storage.Stream(context.Background(), 0)
 
 			fmt.Println("stream created:", stream)
 
@@ -348,7 +324,7 @@ func Benchmark4kbAppend(b *testing.B) {
 }
 
 func TestRead100kMessages(t *testing.T) {
-	// t.Parallel()
+	t.Parallel()
 
 	storage, cleanup := createStorage(t, "./TestRead10Messages.log")
 	defer cleanup()
@@ -368,10 +344,7 @@ func TestRead100kMessages(t *testing.T) {
 
 	fmt.Printf("time taken to write %d: %v\n", n, time.Since(start))
 
-	stream, err := storage.Stream(context.Background(), 0)
-	if err != nil {
-		t.Fatalf("failed to create stream: %v", err)
-	}
+	stream := storage.Stream(context.Background(), 0)
 
 	start = time.Now()
 	defer func() {

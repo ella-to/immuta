@@ -217,72 +217,18 @@ func (s *Storage) Close() error {
 	return s.w.Close()
 }
 
-func (s *Storage) getIndexFromPos(ctx context.Context, startPos int64) (int64, error) {
-	fd, err := s.getFd(ctx)
-	if err != nil {
-		return -1, err
-	}
-	defer s.putFd(context.WithoutCancel(ctx), fd)
-
-	// moved to the beginning of the file
-	// to read the total number of messages
-
-	fd.Seek(0, io.SeekStart)
-
-	var total int64
-	err = binary.Read(fd, binary.LittleEndian, &total)
-	if err != nil {
-		return -1, err
-	}
-
-	// if startPos is negative, start from the latest messages
-
-	if startPos < 0 || total-startPos <= 0 {
-		stat, err := fd.Stat()
-		if err != nil {
-			return -1, err
-		}
-		return stat.Size(), nil
-	} else if startPos == 0 {
-		return HeaderSize, nil
-	}
-
-	var index int64 = HeaderSize
-
-	for range startPos {
-		var size int64
-		err = binary.Read(fd, binary.LittleEndian, &size)
-		if err != nil {
-			return -1, err
-		}
-
-		_, err = fd.Seek(size, io.SeekCurrent)
-		if err != nil {
-			return -1, err
-		}
-
-		index += size + HeaderSize
-	}
-
-	return index, nil
-}
-
 // Stream(ctx, 0) 	-> from the beginning
 // Stream(ctx, -1) 	-> start from latest messages
 // Stream(ctx, 10) 	-> start after 10nth message
-func (s *Storage) Stream(ctx context.Context, startPos int64) (Stream, error) {
-	index, err := s.getIndexFromPos(ctx, startPos)
-	if err != nil {
-		return nil, err
-	}
-
+func (s *Storage) Stream(ctx context.Context, startPos int64) Stream {
 	return &stream{
-		id:     s.streamIdcount.Add(1),
-		index:  index,
-		getFd:  s.getFd,
-		putFd:  s.putFd,
-		signal: s.bc.CreateSignal(solid.WithHistory(startPos)),
-	}, nil
+		id:       s.streamIdcount.Add(1),
+		index:    -1,
+		startPos: startPos,
+		getFd:    s.getFd,
+		putFd:    s.putFd,
+		signal:   s.bc.CreateSignal(solid.WithHistory(startPos)),
+	}
 }
 
 func New(filepath string, readerCount int, fastWrite bool) (*Storage, error) {
@@ -374,11 +320,12 @@ func getSize(w *os.File) (int64, error) {
 //
 
 type stream struct {
-	id     int64
-	index  int64
-	getFd  func(context.Context) (*os.File, error)
-	putFd  func(context.Context, *os.File) error
-	signal *solid.Signal
+	id       int64
+	index    int64
+	startPos int64
+	getFd    func(context.Context) (*os.File, error)
+	putFd    func(context.Context, *os.File) error
+	signal   *solid.Signal
 }
 
 func (s *stream) String() string {
@@ -386,6 +333,50 @@ func (s *stream) String() string {
 }
 
 var _ Stream = (*stream)(nil)
+
+func (s *stream) findIndex(fd *os.File) (int64, error) {
+	// moved to the beginning of the file
+	// to read the total number of messages
+
+	fd.Seek(0, io.SeekStart)
+
+	var total int64
+	err := binary.Read(fd, binary.LittleEndian, &total)
+	if err != nil {
+		return -1, err
+	}
+
+	// if startPos is negative, start from the latest messages
+
+	if s.startPos < 0 || total-s.startPos <= 0 {
+		stat, err := fd.Stat()
+		if err != nil {
+			return -1, err
+		}
+		return stat.Size(), nil
+	} else if s.startPos == 0 {
+		return HeaderSize, nil
+	}
+
+	var index int64 = HeaderSize
+
+	for range s.startPos {
+		var size int64
+		err = binary.Read(fd, binary.LittleEndian, &size)
+		if err != nil {
+			return -1, err
+		}
+
+		_, err = fd.Seek(size, io.SeekCurrent)
+		if err != nil {
+			return -1, err
+		}
+
+		index += size + HeaderSize
+	}
+
+	return index, nil
+}
 
 func (s *stream) Next(ctx context.Context) (r io.Reader, size int64, err error) {
 CHECK:
@@ -397,6 +388,13 @@ CHECK:
 	fd, err := s.getFd(ctx)
 	if err != nil {
 		return nil, -1, err
+	}
+
+	if s.index == -1 {
+		s.index, err = s.findIndex(fd)
+		if err != nil {
+			return nil, -1, err
+		}
 	}
 
 	_, err = fd.Seek(s.index, io.SeekStart)
