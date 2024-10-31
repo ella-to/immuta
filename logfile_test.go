@@ -223,8 +223,8 @@ func TestSingleWriteMultipleReader(t *testing.T) {
 
 	content := []byte("hello world")
 
-	n := 10
-	readersCount := 2
+	n := 100_000
+	readersCount := 11
 
 	var wg sync.WaitGroup
 
