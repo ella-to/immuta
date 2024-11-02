@@ -291,7 +291,7 @@ func New(filepath string, readerCount int, fastWrite bool) (*Storage, error) {
 	storage := &Storage{
 		w:         w,
 		fds:       make(chan *os.File, readerCount),
-		bc:        solid.NewBroadcast(),
+		bc:        solid.NewBroadcast(solid.WithInitialTotal(count)),
 		currSize:  size,
 		currCount: count,
 	}

@@ -465,3 +465,49 @@ func TestJson(t *testing.T) {
 		t.Fatalf("expected map to be non-nil")
 	}
 }
+
+func TestCreateStopRead(t *testing.T) {
+	os.Remove("./TestCreateStopRead.log")
+	defer os.Remove("./TestCreateStopRead.log")
+
+	storage, err := immuta.New("./TestCreateStopRead.log", 10, true)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+
+	for i := 0; i < 10; i++ {
+		_, _, err := storage.Append(context.Background(), strings.NewReader(fmt.Sprintf("hello world %d", i)))
+		if err != nil {
+			t.Fatalf("failed to append content: %v", err)
+		}
+	}
+
+	storage.Close()
+
+	storage, err = immuta.New("./TestCreateStopRead.log", 10, true)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+
+	stream := storage.Stream(context.Background(), 0)
+	defer stream.Done()
+
+	for i := 0; i < 10; i++ {
+		func() {
+			r, _, err := stream.Next(context.Background())
+			if err != nil {
+				t.Errorf("failed to read content: %v", err)
+			}
+			defer r.Done()
+
+			buf := new(bytes.Buffer)
+			if _, err := buf.ReadFrom(r); err != nil {
+				t.Errorf("failed to read content: %v", err)
+			}
+
+			if buf.String() != fmt.Sprintf("hello world %d", i) {
+				t.Errorf("expected content to be %s, got %s", fmt.Sprintf("hello world %d", i), buf.String())
+			}
+		}()
+	}
+}
