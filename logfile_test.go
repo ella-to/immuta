@@ -515,7 +515,7 @@ func TestCreateStopRead(t *testing.T) {
 func TestStartLatest(t *testing.T) {
 	t.Parallel()
 
-	storage, cleanup := createStorage(t, "./TestJson.log")
+	storage, cleanup := createStorage(t, "./TestStartLatest.log")
 	defer cleanup()
 
 	_, _, err := storage.Append(context.Background(), strings.NewReader(fmt.Sprintf("hello world 0")))
