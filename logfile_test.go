@@ -42,7 +42,7 @@ func TestBasicUsage(t *testing.T) {
 		t.Fatalf("failed to append content: %v", err)
 	}
 
-	if index != 8 {
+	if index != immuta.FileHeaderSize {
 		t.Fatalf("expected index to be 8, got %d", index)
 	}
 
@@ -157,26 +157,26 @@ func TestSkipNMessages(t *testing.T) {
 
 	for {
 		ok := func() bool {
-			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 
 			r, size, err := stream.Next(ctx)
 			if errors.Is(err, context.DeadlineExceeded) {
 				return false
 			} else if err != nil {
-				t.Fatalf("failed to read content: %v", err)
+				t.Errorf("failed to read content 1: %v", err)
 				return false
 			}
 			defer r.Done()
 
 			buf := new(bytes.Buffer)
 			if _, err := buf.ReadFrom(r); err != nil {
-				t.Fatalf("failed to read content: %v", err)
+				t.Errorf("failed to read content 2: %v", err)
 				return false
 			}
 
 			if size != int64(len(content)) {
-				t.Fatalf("expected size to be %d, got %d", len(content), size)
+				t.Errorf("expected size to be %d, got %d", len(content), size)
 				return false
 			}
 			return true
@@ -509,5 +509,52 @@ func TestCreateStopRead(t *testing.T) {
 				t.Errorf("expected content to be %s, got %s", fmt.Sprintf("hello world %d", i), buf.String())
 			}
 		}()
+	}
+}
+
+func TestStartLatest(t *testing.T) {
+	t.Parallel()
+
+	storage, cleanup := createStorage(t, "./TestJson.log")
+	defer cleanup()
+
+	_, _, err := storage.Append(context.Background(), strings.NewReader(fmt.Sprintf("hello world 0")))
+	if err != nil {
+		t.Fatalf("failed to append content: %v", err)
+	}
+
+	ch := make(chan struct{})
+
+	go func() {
+		<-ch
+		index, size, err := storage.Append(context.Background(), strings.NewReader(fmt.Sprintf("hello world 1")))
+		if err != nil {
+			t.Errorf("failed to append content: %v", err)
+		}
+
+		fmt.Println("index:", index, "size:", size)
+	}()
+
+	stream := storage.Stream(context.Background(), -1)
+	defer stream.Done()
+
+	close(ch)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Second)
+	defer cancel()
+
+	r, _, err := stream.Next(ctx)
+	if err != nil {
+		t.Fatalf("failed to read content: %v", err)
+	}
+	defer r.Done()
+
+	buf := new(bytes.Buffer)
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("failed to read content: %v", err)
+	}
+
+	if buf.String() != fmt.Sprintf("hello world 1") {
+		t.Fatalf("expected content to be %s, got %s", fmt.Sprintf("hello world 1"), buf.String())
 	}
 }

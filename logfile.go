@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"sync/atomic"
 
@@ -14,11 +13,13 @@ import (
 )
 
 const (
-	HeaderSize = 8
+	FileHeaderSize   = 8 + 8 // total number of messages + index of the last message
+	RecordHeaderSize = 8     // size of the content of the message
 )
 
 var (
-	emptyHeader = make([]byte, HeaderSize)
+	emptyFileHeader   = make([]byte, FileHeaderSize)
+	emptyRecordHeader = make([]byte, RecordHeaderSize)
 )
 
 // Appender is a single method interface that writes the content of the reader to the storage medium.
@@ -48,6 +49,7 @@ type Storage struct {
 	bc            *solid.Broadcast
 	currSize      int64
 	currCount     int64
+	lastIndex     int64
 	streamIdcount atomic.Int64
 }
 
@@ -72,6 +74,25 @@ func (s *Storage) putFd(ctx context.Context, fd *os.File) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func loadFileHeader(fd *os.File) (total int64, index int64, err error) {
+	_, err = fd.Seek(0, io.SeekStart)
+	if err != nil {
+		return -1, -1, err
+	}
+
+	err = binary.Read(fd, binary.LittleEndian, &total)
+	if err != nil {
+		return -1, -1, err
+	}
+
+	err = binary.Read(fd, binary.LittleEndian, &index)
+	if err != nil {
+		return -1, -1, err
+	}
+
+	return total, index, nil
 }
 
 func (s *Storage) Details() (string, error) {
@@ -103,13 +124,11 @@ func (s *Storage) Verify() error {
 
 	size := stat.Size()
 
-	var total int64
-	err = binary.Read(fd, binary.LittleEndian, &total)
-	if err != nil {
-		return err
-	}
+	total, lastIndex, err := loadFileHeader(fd)
 
-	var calculateSize int64 = HeaderSize
+	var calculateSize int64 = FileHeaderSize
+
+	var currIndex int64
 
 	for range total {
 		var contentSize int64
@@ -122,49 +141,63 @@ func (s *Storage) Verify() error {
 		if err != nil {
 			return err
 		}
-
-		calculateSize += contentSize + HeaderSize
+		currIndex = calculateSize
+		calculateSize += contentSize + RecordHeaderSize
 	}
 
 	if size != calculateSize {
 		return fmt.Errorf("size mismatch: expected %d, got %d", calculateSize, size)
 	}
 
+	if lastIndex != currIndex {
+		return fmt.Errorf("last index mismatch: expected %d, got %d", currIndex, lastIndex)
+	}
+
 	return nil
 }
 
+// Append should only be called by a single goroutine at a time. It is not safe for concurrent use.
 func (s *Storage) Append(ctx context.Context, r io.Reader) (index int64, size int64, err error) {
 	defer func() {
-		var shouldSignal bool
-
 		// if there is an error, move the current position back to the original position
-		if err == nil {
-			s.currSize += size + HeaderSize
-			s.currCount++
-
-			_, err = s.w.Seek(0, io.SeekStart)
-			if err != nil {
-				slog.Error("failed to seek to the beginning of the file", "err", err)
-			} else {
-				err = binary.Write(s.w, binary.LittleEndian, s.currCount)
-				if err != nil {
-					slog.Error("failed to write the size of the content", "err", err)
-				} else {
-					shouldSignal = true
-				}
-			}
-
-			if shouldSignal {
-				s.bc.Notify()
-			}
-
-		} else {
+		if err != nil {
 			// truncate the file to the original size
 			err = s.w.Truncate(s.currSize)
 			if err != nil {
-				slog.Error("failed to truncate the file", "err", err, "size", s.currSize)
+				err = fmt.Errorf("failed to truncate the file: %w", err)
 			}
+
+			return
 		}
+
+		_, err = s.w.Seek(0, io.SeekStart)
+		if err != nil {
+			err = fmt.Errorf("failed to seek to the beginning of the file: %w", err)
+			return
+		}
+
+		currCount := s.currCount + 1
+
+		// write the total number of messages and the index of the last message
+		// into a single 16 bytes and write it to the beginning of the file
+		// to make sure that the file is consistent and if the file is corrupted
+		// revert back to the original state.
+		var header [16]byte
+		binary.LittleEndian.PutUint64(header[:8], uint64(currCount))
+		binary.LittleEndian.PutUint64(header[8:], uint64(index))
+
+		_, err = s.w.Write(header[:])
+		if err != nil {
+			err = fmt.Errorf("failed to write the header: %w", err)
+			return
+		}
+
+		// only update the current size and the last index if there is no error
+		s.currSize += size + RecordHeaderSize
+		s.lastIndex = index
+		s.currCount = currCount
+
+		s.bc.Notify()
 	}()
 
 	index = s.currSize
@@ -176,7 +209,7 @@ func (s *Storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 
 	// write header first
 	//
-	_, err = s.w.Write(emptyHeader)
+	_, err = s.w.Write(emptyRecordHeader)
 	if err != nil {
 		return -1, -1, err
 	}
@@ -188,11 +221,11 @@ func (s *Storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 		return -1, -1, err
 	}
 
-	currSize := s.currSize + size + HeaderSize
+	currSize := s.currSize + size + RecordHeaderSize
 
 	// Move back to the header of the content
 	//
-	_, err = s.w.Seek(currSize-(size+HeaderSize), io.SeekStart)
+	_, err = s.w.Seek(currSize-(size+RecordHeaderSize), io.SeekStart)
 	if err != nil {
 		return -1, -1, err
 	}
@@ -220,6 +253,8 @@ func (s *Storage) Close() error {
 // Stream(ctx, 0) 	-> from the beginning
 // Stream(ctx, -1) 	-> start from latest messages
 // Stream(ctx, 10) 	-> start after 10nth message
+//
+// NOTE: Creating a stream does not block the storage from writing new messages can it is concurrent safe.
 func (s *Storage) Stream(ctx context.Context, startPos int64) Stream {
 	return &stream{
 		id:       s.streamIdcount.Add(1),
@@ -227,8 +262,13 @@ func (s *Storage) Stream(ctx context.Context, startPos int64) Stream {
 		startPos: startPos,
 		getFd:    s.getFd,
 		putFd:    s.putFd,
+		getLast:  s.getLastIndex,
 		signal:   s.bc.CreateSignal(solid.WithHistory(startPos)),
 	}
+}
+
+func (s *Storage) getLastIndex() int64 {
+	return s.lastIndex
 }
 
 func New(filepath string, readerCount int, fastWrite bool) (*Storage, error) {
@@ -255,7 +295,7 @@ func New(filepath string, readerCount int, fastWrite bool) (*Storage, error) {
 	}
 
 	if size == 0 {
-		_, err = w.Write(emptyHeader)
+		_, err = w.Write(emptyFileHeader)
 		if err != nil {
 			return nil, err
 		}
@@ -272,6 +312,14 @@ func New(filepath string, readerCount int, fastWrite bool) (*Storage, error) {
 
 	var count int64
 	err = binary.Read(w, binary.LittleEndian, &count)
+	if err != nil {
+		return nil, err
+	}
+
+	// read the next 8 bytes to get the index of the last message
+
+	var lastIndex int64
+	err = binary.Read(w, binary.LittleEndian, &lastIndex)
 	if err != nil {
 		return nil, err
 	}
@@ -294,6 +342,7 @@ func New(filepath string, readerCount int, fastWrite bool) (*Storage, error) {
 		bc:        solid.NewBroadcast(solid.WithInitialTotal(count)),
 		currSize:  size,
 		currCount: count,
+		lastIndex: lastIndex,
 	}
 
 	for i := 0; i < readerCount; i++ {
@@ -325,6 +374,7 @@ type stream struct {
 	startPos int64
 	getFd    func(context.Context) (*os.File, error)
 	putFd    func(context.Context, *os.File) error
+	getLast  func() int64
 	signal   *solid.Signal
 }
 
@@ -340,8 +390,7 @@ func (s *stream) findIndex(fd *os.File) (int64, error) {
 
 	fd.Seek(0, io.SeekStart)
 
-	var total int64
-	err := binary.Read(fd, binary.LittleEndian, &total)
+	total, _, err := loadFileHeader(fd)
 	if err != nil {
 		return -1, err
 	}
@@ -349,16 +398,12 @@ func (s *stream) findIndex(fd *os.File) (int64, error) {
 	// if startPos is negative, start from the latest messages
 
 	if s.startPos < 0 || total-s.startPos <= 0 {
-		stat, err := fd.Stat()
-		if err != nil {
-			return -1, err
-		}
-		return stat.Size(), nil
+		return s.getLast(), nil
 	} else if s.startPos == 0 {
-		return HeaderSize, nil
+		return FileHeaderSize, nil
 	}
 
-	var index int64 = HeaderSize
+	var index int64 = FileHeaderSize
 
 	for range s.startPos {
 		var size int64
@@ -372,7 +417,7 @@ func (s *stream) findIndex(fd *os.File) (int64, error) {
 			return -1, err
 		}
 
-		index += size + HeaderSize
+		index += size + RecordHeaderSize
 	}
 
 	return index, nil
@@ -392,9 +437,9 @@ CHECK:
 
 	defer func() {
 		if err != nil {
-			err = s.putFd(ctx, fd)
-			if err != nil {
-				slog.Error("failed to return the file descriptor back to the pool", "err", err)
+			err1 := s.putFd(context.WithoutCancel(ctx), fd)
+			if err1 != nil {
+				err = errors.Join(err, fmt.Errorf("failed to put fd: %w", err1))
 			}
 		}
 	}()
@@ -413,7 +458,6 @@ CHECK:
 
 	err = binary.Read(fd, binary.LittleEndian, &size)
 	if errors.Is(err, io.EOF) {
-
 		goto CHECK
 	} else if err != nil {
 		return nil, -1, fmt.Errorf("failed to read size of content at %d, id: %d: %w", s.index, s.id, err)
@@ -422,7 +466,7 @@ CHECK:
 	return &Reader{
 		r: io.LimitReader(fd, size),
 		done: func() error {
-			s.index += size + HeaderSize
+			s.index += size + RecordHeaderSize
 			return s.putFd(ctx, fd)
 		},
 	}, size, nil
