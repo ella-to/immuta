@@ -12,14 +12,21 @@ import (
 )
 
 func main() {
-	filename := "./data.log"
+	logDir := "./log-data"
 	poolFileDescriptor := 10
 	// fastwrite uses the buffer for each append
 	// if you need gurrantee on saving on disk, enable set fastWrite to false
 	// the Append operation will get the performance hit
 	fastWrite := true
 
-	log, err := immuta.New(filename, poolFileDescriptor, fastWrite)
+	namespace := "default"
+
+	log, err := immuta.New(
+		immuta.WithLogsDirPath(logDir),
+		immuta.WithReaderCount(poolFileDescriptor),
+		immuta.WithFastWrite(fastWrite),
+		immuta.WithNamespaces(namespace),
+	)
 	if err != nil {
 		panic(err)
 	}
@@ -28,7 +35,7 @@ func main() {
 	content := []byte("hello world")
 
 	// write to append only log
-	index, size, err := log.Append(context.Background(), bytes.NewReader(content))
+	index, size, err := log.Append(context.Background(), namespace, bytes.NewReader(content))
 	if err != nil {
 		panic(err)
 	}
@@ -47,7 +54,7 @@ func main() {
 	var startPos int64 = 0
 
 	// this call doesn't allocate any file descriptor yet
-	stream := log.Stream(context.Background(), startPos)
+	stream := log.Stream(context.Background(), namespace, startPos)
 	defer stream.Done()
 
 	for {

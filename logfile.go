@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 
 	"ella.to/solid"
@@ -20,6 +21,11 @@ const (
 var (
 	emptyFileHeader   = make([]byte, FileHeaderSize)
 	emptyRecordHeader = make([]byte, RecordHeaderSize)
+)
+
+var (
+	ErrNamespaceRequired = errors.New("namespace is required")
+	ErrNamesapceNotFound = errors.New("namespace not found")
 )
 
 // Appender is a single method interface that writes the content of the reader to the storage medium.
@@ -43,7 +49,7 @@ type Stream interface {
 // Storage
 //
 
-type Storage struct {
+type storage struct {
 	w             *os.File
 	fds           chan *os.File
 	bc            *solid.Broadcast
@@ -53,9 +59,9 @@ type Storage struct {
 	streamIdcount atomic.Int64
 }
 
-var _ Appender = (*Storage)(nil)
+var _ Appender = (*storage)(nil)
 
-func (s *Storage) getFd(ctx context.Context) (*os.File, error) {
+func (s *storage) getFd(ctx context.Context) (*os.File, error) {
 	select {
 	case fd, ok := <-s.fds:
 		if !ok {
@@ -67,7 +73,7 @@ func (s *Storage) getFd(ctx context.Context) (*os.File, error) {
 	}
 }
 
-func (s *Storage) putFd(ctx context.Context, fd *os.File) error {
+func (s *storage) putFd(ctx context.Context, fd *os.File) error {
 	select {
 	case s.fds <- fd:
 		return nil
@@ -95,7 +101,7 @@ func loadFileHeader(fd *os.File) (total int64, index int64, err error) {
 	return total, index, nil
 }
 
-func (s *Storage) Details() (string, error) {
+func (s *storage) Details() (string, error) {
 	fd, err := s.getFd(context.Background())
 	if err != nil {
 		return "", err
@@ -110,7 +116,7 @@ func (s *Storage) Details() (string, error) {
 	return fmt.Sprintf("size: %d, count: %d", stat.Size(), s.currCount), nil
 }
 
-func (s *Storage) Verify() error {
+func (s *storage) Verify() error {
 	fd, err := s.getFd(context.Background())
 	if err != nil {
 		return err
@@ -157,7 +163,7 @@ func (s *Storage) Verify() error {
 }
 
 // Append should only be called by a single goroutine at a time. It is not safe for concurrent use.
-func (s *Storage) Append(ctx context.Context, r io.Reader) (index int64, size int64, err error) {
+func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size int64, err error) {
 	defer func() {
 		// if there is an error, move the current position back to the original position
 		if err != nil {
@@ -240,7 +246,7 @@ func (s *Storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 	return index, size, nil
 }
 
-func (s *Storage) Close() error {
+func (s *storage) Close() error {
 	for range cap(s.fds) {
 		fd := <-s.fds
 		if err := fd.Close(); err != nil {
@@ -255,7 +261,7 @@ func (s *Storage) Close() error {
 // Stream(ctx, 10) 	-> start after 10nth message
 //
 // NOTE: Creating a stream does not block the storage from writing new messages can it is concurrent safe.
-func (s *Storage) Stream(ctx context.Context, startPos int64) Stream {
+func (s *storage) Stream(ctx context.Context, startPos int64) Stream {
 	return &stream{
 		id:       s.streamIdcount.Add(1),
 		index:    -1,
@@ -267,11 +273,153 @@ func (s *Storage) Stream(ctx context.Context, startPos int64) Stream {
 	}
 }
 
-func (s *Storage) getLastIndex() int64 {
+func (s *storage) getLastIndex() int64 {
 	return s.lastIndex
 }
 
-func New(filepath string, readerCount int, fastWrite bool) (*Storage, error) {
+type Storage struct {
+	mapper map[string]*storage
+}
+
+func (s *Storage) Close() error {
+	for _, st := range s.mapper {
+		if err := st.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Storage) getStorageByNamespace(namespace string) (*storage, error) {
+	if namespace == "" {
+		return nil, ErrNamespaceRequired
+	}
+
+	st, ok := s.mapper[namespace]
+	if !ok {
+		return nil, ErrNamesapceNotFound
+	}
+	return st, nil
+}
+
+func (s *Storage) Append(ctx context.Context, namespace string, r io.Reader) (index int64, size int64, err error) {
+	st, err := s.getStorageByNamespace(namespace)
+	if err != nil {
+		return -1, -1, err
+	}
+
+	return st.Append(ctx, r)
+}
+
+func (s *Storage) Stream(ctx context.Context, namespace string, startPos int64) Stream {
+	st, err := s.getStorageByNamespace(namespace)
+	if err != nil {
+		panic(err)
+	}
+
+	return st.Stream(ctx, startPos)
+}
+
+func (s *Storage) Details(namespace string) (string, error) {
+	st, err := s.getStorageByNamespace(namespace)
+	if err != nil {
+		return "", err
+	}
+
+	return st.Details()
+}
+
+func (s *Storage) Verify(namespace string) error {
+	st, err := s.getStorageByNamespace(namespace)
+	if err != nil {
+		return err
+	}
+
+	return st.Verify()
+}
+
+type options struct {
+	logsDirPath string
+	readerCount int
+	fastWrite   bool
+	namespaces  []string
+}
+
+type OptionFunc func(*options) error
+
+func WithLogsDirPath(path string) OptionFunc {
+	return func(o *options) error {
+		o.logsDirPath = path
+		return nil
+	}
+}
+
+func WithReaderCount(count int) OptionFunc {
+	return func(o *options) error {
+		if count <= 0 {
+			return fmt.Errorf("readerCount must be greater than 0")
+		}
+
+		o.readerCount = count
+		return nil
+	}
+}
+
+func WithFastWrite(fast bool) OptionFunc {
+	return func(o *options) error {
+		o.fastWrite = fast
+		return nil
+	}
+}
+
+func WithNamespaces(namespaces ...string) OptionFunc {
+	return func(o *options) error {
+		o.namespaces = namespaces
+		return nil
+	}
+}
+
+func New(optFns ...OptionFunc) (*Storage, error) {
+	o := &options{
+		logsDirPath: "./logs",
+		readerCount: 5,
+		fastWrite:   true,
+		namespaces:  nil,
+	}
+
+	for _, fn := range optFns {
+		if err := fn(o); err != nil {
+			return nil, err
+		}
+	}
+
+	if len(o.namespaces) == 0 {
+		return nil, fmt.Errorf("no namespaces provided")
+	}
+
+	err := os.MkdirAll(o.logsDirPath, 0755)
+	if errors.Is(err, os.ErrExist) {
+		// do nothing
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to create logs directory %s: %w", o.logsDirPath, err)
+	}
+
+	mapper := make(map[string]*storage, len(o.namespaces))
+	for _, namespace := range o.namespaces {
+		logFile := filepath.Join(o.logsDirPath, fmt.Sprintf("%s.log", namespace))
+		st, err := new(logFile, o.readerCount, o.fastWrite)
+		if err != nil {
+			return nil, err
+		}
+		mapper[namespace] = st
+	}
+
+	return &Storage{
+		mapper: mapper,
+	}, nil
+}
+
+func new(filepath string, readerCount int, fastWrite bool) (*storage, error) {
 	if readerCount <= 0 {
 		return nil, fmt.Errorf("readerCount must be greater than 0")
 	}
@@ -336,7 +484,7 @@ func New(filepath string, readerCount int, fastWrite bool) (*Storage, error) {
 		return nil, err
 	}
 
-	storage := &Storage{
+	storage := &storage{
 		w:         w,
 		fds:       make(chan *os.File, readerCount),
 		bc:        solid.NewBroadcast(solid.WithInitialTotal(count)),
