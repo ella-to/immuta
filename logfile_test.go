@@ -471,8 +471,8 @@ func TestJson(t *testing.T) {
 }
 
 func TestCreateStopRead(t *testing.T) {
-	os.Remove("./TestCreateStopRead")
-	defer os.Remove("./TestCreateStopRead")
+	os.RemoveAll("./TestCreateStopRead")
+	defer os.RemoveAll("./TestCreateStopRead")
 
 	storage, err := immuta.New(
 		immuta.WithFastWrite(true),
