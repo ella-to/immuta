@@ -46,14 +46,22 @@ import (
 )
 
 func main() {
-	filename := "./data.log"
+	logDir := "./log-data"
 	poolFileDescriptor := 10
 	// fastwrite uses the buffer for each append
 	// if you need gurrantee on saving on disk, enable set fastWrite to false
 	// the Append operation will get the performance hit
 	fastWrite := true
 
-	log, err := immuta.New(filename, poolFileDescriptor, fastWrite)
+	// namespace is isolating the data in it's own file which managed by immuta
+	namespace := "default"
+
+	log, err := immuta.New(
+		immuta.WithLogsDirPath(logDir),
+		immuta.WithReaderCount(poolFileDescriptor),
+		immuta.WithFastWrite(fastWrite),
+		immuta.WithNamespaces(namespace),
+	)
 	if err != nil {
 		panic(err)
 	}
@@ -62,7 +70,7 @@ func main() {
 	content := []byte("hello world")
 
 	// write to append only log
-	index, size, err := log.Append(context.Background(), bytes.NewReader(content))
+	index, size, err := log.Append(context.Background(), namespace, bytes.NewReader(content))
 	if err != nil {
 		panic(err)
 	}
@@ -81,7 +89,7 @@ func main() {
 	var startPos int64 = 0
 
 	// this call doesn't allocate any file descriptor yet
-	stream := log.Stream(context.Background(), startPos)
+	stream := log.Stream(context.Background(), namespace, startPos)
 	defer stream.Done()
 
 	for {
@@ -131,7 +139,7 @@ goos: darwin
 goarch: arm64
 pkg: ella.to/immuta
 cpu: Apple M2 Pro
-Benchmark1kbAppend-12             103730              9882 ns/op              64 B/op          3 allocs/op
+Benchmark1kbAppend-12             119136             10111 ns/op              56 B/op          2 allocs/op
 ```
 
 - Reading the 100k record is under 150ms
@@ -139,6 +147,9 @@ Benchmark1kbAppend-12             103730              9882 ns/op              64
 ```
 go test -timeout 30s -run ^TestRead100kMessages$ ella.to/immuta -v
 === RUN   TestRead100kMessages
-time taken to write 100000: 895.478792ms
-time taken to read 100000: 139.394542ms
+=== PAUSE TestRead100kMessages
+=== CONT  TestRead100kMessages
+time taken to write 100000: 925.566167ms
+time taken to read 100000: 148.137541ms
+--- PASS: TestRead100kMessages (1.07s)
 ```
