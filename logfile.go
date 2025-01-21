@@ -297,7 +297,7 @@ func (s *Storage) getStorageByNamespace(namespace string) (*storage, error) {
 
 	st, ok := s.mapper[namespace]
 	if !ok {
-		return nil, ErrNamesapceNotFound
+		return nil, fmt.Errorf("%w: %s", ErrNamesapceNotFound, namespace)
 	}
 	return st, nil
 }
