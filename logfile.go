@@ -28,6 +28,15 @@ var (
 	ErrNamesapceNotFound = errors.New("namespace not found")
 )
 
+// Compressor is an interface for compression algorithms.
+// Implementations should handle compression and decompression of data.
+type Compressor interface {
+	// Compress takes a reader and returns a reader that compresses the data.
+	Compress(r io.Reader) (io.Reader, error)
+	// Decompress takes a reader and returns a reader that decompresses the data.
+	Decompress(r io.Reader) (io.Reader, error)
+}
+
 // Appender is a single method interface that writes the content of the reader to the storage medium.
 type Appender interface {
 	// Append writes the content of the reader to the storage medium.
@@ -57,6 +66,7 @@ type storage struct {
 	currCount     int64
 	lastIndex     int64
 	streamIdcount atomic.Int64
+	compressor    Compressor
 }
 
 var _ Appender = (*storage)(nil)
@@ -223,9 +233,18 @@ func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 		return -1, -1, err
 	}
 
+	// compress the content if compressor is provided
+	var contentReader io.Reader = r
+	if s.compressor != nil {
+		contentReader, err = s.compressor.Compress(r)
+		if err != nil {
+			return -1, -1, fmt.Errorf("failed to compress content: %w", err)
+		}
+	}
+
 	// copy the content
 	//
-	size, err = io.Copy(s.w, r)
+	size, err = io.Copy(s.w, contentReader)
 	if err != nil {
 		return -1, -1, err
 	}
@@ -266,13 +285,14 @@ func (s *storage) Close() error {
 // NOTE: Creating a stream does not block the storage from writing new messages can it is concurrent safe.
 func (s *storage) Stream(ctx context.Context, startPos int64) Stream {
 	return &stream{
-		id:       s.streamIdcount.Add(1),
-		index:    -1,
-		startPos: startPos,
-		getFd:    s.getFd,
-		putFd:    s.putFd,
-		getLast:  s.getLastIndex,
-		signal:   s.bc.CreateSignal(solid.WithHistory(startPos)),
+		id:         s.streamIdcount.Add(1),
+		index:      -1,
+		startPos:   startPos,
+		getFd:      s.getFd,
+		putFd:      s.putFd,
+		getLast:    s.getLastIndex,
+		signal:     s.bc.CreateSignal(solid.WithHistory(startPos)),
+		compressor: s.compressor,
 	}
 }
 
@@ -346,6 +366,7 @@ type options struct {
 	readerCount int
 	fastWrite   bool
 	namespaces  []string
+	compressor  Compressor
 }
 
 type OptionFunc func(*options) error
@@ -382,6 +403,13 @@ func WithNamespaces(namespaces ...string) OptionFunc {
 	}
 }
 
+func WithCompression(compressor Compressor) OptionFunc {
+	return func(o *options) error {
+		o.compressor = compressor
+		return nil
+	}
+}
+
 func New(optFns ...OptionFunc) (*Storage, error) {
 	o := &options{
 		logsDirPath: "./logs",
@@ -408,7 +436,7 @@ func New(optFns ...OptionFunc) (*Storage, error) {
 	mapper := make(map[string]*storage, len(o.namespaces))
 	for _, namespace := range o.namespaces {
 		logFile := filepath.Join(o.logsDirPath, fmt.Sprintf("%s.log", namespace))
-		st, err := new(logFile, o.readerCount, o.fastWrite)
+		st, err := new(logFile, o.readerCount, o.fastWrite, o.compressor)
 		if err != nil {
 			return nil, err
 		}
@@ -420,7 +448,7 @@ func New(optFns ...OptionFunc) (*Storage, error) {
 	}, nil
 }
 
-func new(filepath string, readerCount int, fastWrite bool) (*storage, error) {
+func new(filepath string, readerCount int, fastWrite bool, compressor Compressor) (*storage, error) {
 	if readerCount <= 0 {
 		return nil, fmt.Errorf("readerCount must be greater than 0")
 	}
@@ -486,12 +514,13 @@ func new(filepath string, readerCount int, fastWrite bool) (*storage, error) {
 	}
 
 	storage := &storage{
-		w:         w,
-		fds:       make(chan *os.File, readerCount),
-		bc:        solid.NewBroadcast(solid.WithInitialTotal(count)),
-		currSize:  size,
-		currCount: count,
-		lastIndex: lastIndex,
+		w:          w,
+		fds:        make(chan *os.File, readerCount),
+		bc:         solid.NewBroadcast(solid.WithInitialTotal(count)),
+		currSize:   size,
+		currCount:  count,
+		lastIndex:  lastIndex,
+		compressor: compressor,
 	}
 
 	for i := 0; i < readerCount; i++ {
@@ -518,13 +547,14 @@ func getSize(w *os.File) (int64, error) {
 //
 
 type stream struct {
-	id       int64
-	index    int64
-	startPos int64
-	getFd    func(context.Context) (*os.File, error)
-	putFd    func(context.Context, *os.File) error
-	getLast  func() int64
-	signal   *solid.Signal
+	id         int64
+	index      int64
+	startPos   int64
+	getFd      func(context.Context) (*os.File, error)
+	putFd      func(context.Context, *os.File) error
+	getLast    func() int64
+	signal     *solid.Signal
+	compressor Compressor
 }
 
 func (s *stream) String() string {
@@ -613,7 +643,8 @@ CHECK:
 	}
 
 	return &Reader{
-		r: io.LimitReader(fd, size),
+		r:          io.LimitReader(fd, size),
+		compressor: s.compressor,
 		done: func() error {
 			s.index += size + RecordHeaderSize
 			return s.putFd(ctx, fd)
@@ -630,13 +661,31 @@ func (s *stream) Done() {
 //
 
 type Reader struct {
-	r    io.Reader
-	done func() error
+	r             io.Reader
+	compressor    Compressor
+	decompressed  io.Reader
+	done          func() error
+	decompressErr error
 }
 
 var _ io.Reader = (*Reader)(nil)
 
 func (r *Reader) Read(p []byte) (n int, err error) {
+	// If compression is enabled and we haven't decompressed yet, do it now
+	if r.compressor != nil && r.decompressed == nil && r.decompressErr == nil {
+		r.decompressed, r.decompressErr = r.compressor.Decompress(r.r)
+	}
+
+	// If we had an error during decompression, return it
+	if r.decompressErr != nil {
+		return 0, r.decompressErr
+	}
+
+	// Read from decompressed reader if available, otherwise from raw reader
+	if r.decompressed != nil {
+		return r.decompressed.Read(p)
+	}
+
 	return r.r.Read(p)
 }
 

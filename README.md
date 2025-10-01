@@ -128,6 +128,111 @@ func main() {
 }
 ```
 
+# Compression
+
+The `immuta` library supports pluggable compression through the `Compressor` interface. This allows you to use any compression algorithm you prefer, such as:
+
+- Standard library algorithms (flate, gzip, zlib, lzw)
+- Third-party algorithms (s2, snappy, zstd, lz4, etc.)
+
+## Compressor Interface
+
+To implement compression, you need to provide a type that implements the `Compressor` interface:
+
+```go
+type Compressor interface {
+    // Compress takes a reader and returns a reader that compresses the data.
+    Compress(r io.Reader) (io.Reader, error)
+    // Decompress takes a reader and returns a reader that decompresses the data.
+    Decompress(r io.Reader) (io.Reader, error)
+}
+```
+
+## Example Implementation
+
+This example shows how to implement the `Compressor` interface using `compress/flate` from the standard library:
+
+```go
+type FlateCompressor struct {
+    level int
+}
+
+func (c *FlateCompressor) Compress(r io.Reader) (io.Reader, error) {
+    var buf bytes.Buffer
+    w, err := flate.NewWriter(&buf, c.level)
+    if err != nil {
+        return nil, err
+    }
+
+    _, err = io.Copy(w, r)
+    if err != nil {
+        w.Close()
+        return nil, err
+    }
+
+    err = w.Close()
+    if err != nil {
+        return nil, err
+    }
+
+    return &buf, nil
+}
+
+func (c *FlateCompressor) Decompress(r io.Reader) (io.Reader, error) {
+    return flate.NewReader(r), nil
+}
+```
+
+## Usage
+
+To enable compression, simply pass your compressor implementation to the `WithCompression` option:
+
+```go
+compressor := NewFlateCompressor(flate.BestSpeed)
+
+log, err := immuta.New(
+    immuta.WithLogsDirPath(logDir),
+    immuta.WithReaderCount(poolFileDescriptor),
+    immuta.WithFastWrite(fastWrite),
+    immuta.WithNamespaces(namespace),
+    immuta.WithCompression(compressor), // Enable compression
+)
+```
+
+Once configured, all data written via `Append()` will be automatically compressed, and all data read via `Stream()` will be automatically decompressed. The compression is transparent to your application code.
+
+## Using Third-Party Compression Libraries
+
+You can use any compression library by implementing the `Compressor` interface. For example, to use `github.com/klauspost/compress/s2`:
+
+```go
+import "github.com/klauspost/compress/s2"
+
+type S2Compressor struct{}
+
+func (c *S2Compressor) Compress(r io.Reader) (io.Reader, error) {
+    var buf bytes.Buffer
+    w := s2.NewWriter(&buf)
+    
+    _, err := io.Copy(w, r)
+    if err != nil {
+        w.Close()
+        return nil, err
+    }
+    
+    err = w.Close()
+    if err != nil {
+        return nil, err
+    }
+    
+    return &buf, nil
+}
+
+func (c *S2Compressor) Decompress(r io.Reader) (io.Reader, error) {
+    return s2.NewReader(r), nil
+}
+```
+
 # Performance
 
 - Appending 100k records of 1kb took around 1 seconds
