@@ -637,7 +637,9 @@ func (s *stream) Next(ctx context.Context) (r *Reader, size int64, err error) {
 		}
 
 		err = s.signal.Wait(ctx)
-		if err != nil {
+		if errors.Is(err, solid.ErrSignalNotAvailable) {
+			return nil, -1, ErrStorageClosed
+		} else if err != nil {
 			return nil, -1, err
 		}
 
