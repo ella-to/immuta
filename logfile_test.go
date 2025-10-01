@@ -242,7 +242,7 @@ func TestSingleWriteMultipleReader(t *testing.T) {
 	go func() {
 		defer wg.Done()
 
-		for i := 0; i < n; i++ {
+		for range n {
 			_, _, err := storage.Append(context.Background(), "default", bytes.NewReader(content))
 			if err != nil {
 				t.Errorf("failed to append content: %v", err)

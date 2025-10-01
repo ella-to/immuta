@@ -603,53 +603,62 @@ func (s *stream) findIndex(fd *os.File) (int64, error) {
 }
 
 func (s *stream) Next(ctx context.Context) (r *Reader, size int64, err error) {
-CHECK:
-	err = s.signal.Wait(ctx)
-	if err != nil {
-		return nil, -1, err
-	}
-
-	fd, err := s.getFd(ctx)
-	if err != nil {
-		return nil, -1, err
-	}
+	var fd *os.File
 
 	defer func() {
-		if err != nil {
-			err1 := s.putFd(context.WithoutCancel(ctx), fd)
-			if err1 != nil {
-				err = errors.Join(err, fmt.Errorf("failed to put fd: %w", err1))
-			}
+		if err == nil || fd == nil {
+			return
+		}
+
+		putFdErr := s.putFd(context.WithoutCancel(ctx), fd)
+		if putFdErr != nil {
+			err = errors.Join(err, fmt.Errorf("failed to put fd: %w", putFdErr))
 		}
 	}()
 
-	if s.index == -1 {
-		s.index, err = s.findIndex(fd)
+	for {
+		err = s.signal.Wait(ctx)
 		if err != nil {
 			return nil, -1, err
 		}
-	}
 
-	_, err = fd.Seek(s.index, io.SeekStart)
-	if err != nil {
-		return nil, -1, fmt.Errorf("failed to seek to index %d, id: %d: %w", s.index, s.id, err)
-	}
+		fd, err = s.getFd(ctx)
+		if err != nil {
+			return nil, -1, err
+		}
 
-	err = binary.Read(fd, binary.LittleEndian, &size)
-	if errors.Is(err, io.EOF) {
-		goto CHECK
-	} else if err != nil {
-		return nil, -1, fmt.Errorf("failed to read size of content at %d, id: %d: %w", s.index, s.id, err)
-	}
+		if s.index == -1 {
+			s.index, err = s.findIndex(fd)
+			if err != nil {
+				return nil, -1, err
+			}
+		}
 
-	return &Reader{
-		r:          io.LimitReader(fd, size),
-		compressor: s.compressor,
-		done: func() error {
-			s.index += size + RecordHeaderSize
-			return s.putFd(ctx, fd)
-		},
-	}, size, nil
+		_, err = fd.Seek(s.index, io.SeekStart)
+		if err != nil {
+			return nil, -1, fmt.Errorf("failed to seek to index %d, id: %d: %w", s.index, s.id, err)
+		}
+
+		err = binary.Read(fd, binary.LittleEndian, &size)
+		if errors.Is(err, io.EOF) {
+			if putErr := s.putFd(context.WithoutCancel(ctx), fd); putErr != nil {
+				return nil, -1, fmt.Errorf("failed to put fd: %w", putErr)
+			}
+			fd = nil
+			continue
+		} else if err != nil {
+			return nil, -1, fmt.Errorf("failed to read size of content at %d, id: %d: %w", s.index, s.id, err)
+		}
+
+		return &Reader{
+			r:          io.LimitReader(fd, size),
+			compressor: s.compressor,
+			done: func() error {
+				s.index += size + RecordHeaderSize
+				return s.putFd(ctx, fd)
+			},
+		}, size, nil
+	}
 }
 
 func (s *stream) Done() {
