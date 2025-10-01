@@ -95,7 +95,7 @@ func TestSingleWriteSingleReader(t *testing.T) {
 	go func() {
 		defer wg.Done()
 
-		for i := 0; i < messagesCount; i++ {
+		for i := range messagesCount {
 			_, _, err := storage.Append(context.Background(), "default", strings.NewReader(fmt.Sprintf("hello world %d", i)))
 			if err != nil {
 				t.Errorf("failed to append content: %v", err)
@@ -109,7 +109,7 @@ func TestSingleWriteSingleReader(t *testing.T) {
 		stream := storage.Stream(context.Background(), "default", 0)
 		defer stream.Done()
 
-		for i := 0; i < messagesCount; i++ {
+		for i := range messagesCount {
 			func() {
 				expectedContent := fmt.Sprintf("hello world %d", i)
 
@@ -195,7 +195,6 @@ func TestSkipNMessages(t *testing.T) {
 	if count != 5 {
 		t.Fatalf("expected to read 5 times, got %d", count)
 	}
-
 }
 
 func TestDetails(t *testing.T) {
@@ -206,7 +205,7 @@ func TestDetails(t *testing.T) {
 
 	n := 10
 
-	for i := 0; i < n; i++ {
+	for range n {
 		_, _, err := storage.Append(context.Background(), "default", bytes.NewReader(content))
 		if err != nil {
 			t.Errorf("failed to append content: %v", err)
@@ -398,14 +397,13 @@ func TestSequence(t *testing.T) {
 		}
 	}()
 
-	for i := 0; i < c; i++ {
+	for range c {
 		go func() {
 			defer wg.Done()
 			stream := storage.Stream(context.Background(), "default", 0)
 			defer stream.Done()
 
-			for i := 0; i < n; i++ {
-
+			for i := range n {
 				func() {
 					expectedContent := fmt.Sprintf("hello world %d", i)
 
@@ -483,9 +481,9 @@ func TestCreateStopRead(t *testing.T) {
 		t.Fatalf("failed to create storage: %v", err)
 	}
 
-	for i := 0; i < 10; i++ {
-		_, _, err := storage.Append(context.Background(), "default", strings.NewReader(fmt.Sprintf("hello world %d", i)))
-		if err != nil {
+	for i := range 10 {
+		_, _, appendErr := storage.Append(context.Background(), "default", strings.NewReader(fmt.Sprintf("hello world %d", i)))
+		if appendErr != nil {
 			t.Fatalf("failed to append content: %v", err)
 		}
 	}
@@ -504,7 +502,7 @@ func TestCreateStopRead(t *testing.T) {
 	stream := storage.Stream(context.Background(), "default", 0)
 	defer stream.Done()
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		func() {
 			r, _, err := stream.Next(context.Background())
 			if err != nil {
@@ -530,7 +528,7 @@ func TestStartLatest(t *testing.T) {
 	storage, cleanup := createStorage(t, "./TestStartLatest")
 	defer cleanup()
 
-	_, _, err := storage.Append(context.Background(), "default", strings.NewReader(fmt.Sprintf("hello world 0")))
+	_, _, err := storage.Append(context.Background(), "default", strings.NewReader("hello world 0"))
 	if err != nil {
 		t.Fatalf("failed to append content: %v", err)
 	}
@@ -539,8 +537,8 @@ func TestStartLatest(t *testing.T) {
 
 	go func() {
 		<-ch
-		index, size, err := storage.Append(context.Background(), "default", strings.NewReader(fmt.Sprintf("hello world 1")))
-		if err != nil {
+		index, size, appendErr := storage.Append(context.Background(), "default", strings.NewReader("hello world 1"))
+		if appendErr != nil {
 			t.Errorf("failed to append content: %v", err)
 		}
 
@@ -566,7 +564,7 @@ func TestStartLatest(t *testing.T) {
 		t.Fatalf("failed to read content: %v", err)
 	}
 
-	if buf.String() != fmt.Sprintf("hello world 1") {
-		t.Fatalf("expected content to be %s, got %s", fmt.Sprintf("hello world 1"), buf.String())
+	if buf.String() != "hello world 1" {
+		t.Fatalf("expected content to be %s, got %s", "hello world 1", buf.String())
 	}
 }

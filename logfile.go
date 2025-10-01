@@ -131,6 +131,9 @@ func (s *storage) Verify() error {
 	size := stat.Size()
 
 	total, lastIndex, err := loadFileHeader(fd)
+	if err != nil {
+		return err
+	}
 
 	var calculateSize int64 = FileHeaderSize
 
@@ -397,10 +400,8 @@ func New(optFns ...OptionFunc) (*Storage, error) {
 		return nil, fmt.Errorf("no namespaces provided")
 	}
 
-	err := os.MkdirAll(o.logsDirPath, 0755)
-	if errors.Is(err, os.ErrExist) {
-		// do nothing
-	} else if err != nil {
+	err := os.MkdirAll(o.logsDirPath, 0o755)
+	if err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("failed to create logs directory %s: %w", o.logsDirPath, err)
 	}
 
@@ -432,7 +433,7 @@ func new(filepath string, readerCount int, fastWrite bool) (*storage, error) {
 		flag = os.O_RDWR | os.O_CREATE | os.O_SYNC
 	}
 
-	w, err := os.OpenFile(filepath, flag, 0644)
+	w, err := os.OpenFile(filepath, flag, 0o644)
 	if err != nil {
 		return nil, err
 	}
