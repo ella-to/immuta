@@ -26,6 +26,7 @@ var (
 var (
 	ErrNamespaceRequired = errors.New("namespace is required")
 	ErrNamesapceNotFound = errors.New("namespace not found")
+	ErrStorageClosed     = errors.New("storage is closed")
 )
 
 // Compressor is an interface for compression algorithms.
@@ -67,6 +68,7 @@ type storage struct {
 	lastIndex     int64
 	streamIdcount atomic.Int64
 	compressor    Compressor
+	closed        atomic.Bool
 }
 
 var _ Appender = (*storage)(nil)
@@ -269,12 +271,22 @@ func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 }
 
 func (s *storage) Close() error {
+	// Check if already closed
+	if s.closed.Swap(true) {
+		return nil // Already closed
+	}
+
+	// Close all file descriptor readers
+	close(s.fds)
 	for range cap(s.fds) {
 		fd := <-s.fds
 		if err := fd.Close(); err != nil {
 			return err
 		}
 	}
+
+	s.bc.Close()
+
 	return s.w.Close()
 }
 
@@ -291,6 +303,7 @@ func (s *storage) Stream(ctx context.Context, startPos int64) Stream {
 		getFd:      s.getFd,
 		putFd:      s.putFd,
 		getLast:    s.getLastIndex,
+		isClosed:   func() bool { return s.closed.Load() },
 		signal:     s.bc.CreateSignal(solid.WithHistory(startPos)),
 		compressor: s.compressor,
 	}
@@ -553,6 +566,7 @@ type stream struct {
 	getFd      func(context.Context) (*os.File, error)
 	putFd      func(context.Context, *os.File) error
 	getLast    func() int64
+	isClosed   func() bool
 	signal     *solid.Signal
 	compressor Compressor
 }
@@ -617,9 +631,19 @@ func (s *stream) Next(ctx context.Context) (r *Reader, size int64, err error) {
 	}()
 
 	for {
+		// Check if storage is closed before waiting
+		if s.isClosed() {
+			return nil, -1, ErrStorageClosed
+		}
+
 		err = s.signal.Wait(ctx)
 		if err != nil {
 			return nil, -1, err
+		}
+
+		// Check if storage is closed after waking up from wait
+		if s.isClosed() {
+			return nil, -1, ErrStorageClosed
 		}
 
 		fd, err = s.getFd(ctx)

@@ -568,3 +568,191 @@ func TestStartLatest(t *testing.T) {
 		t.Fatalf("expected content to be %s, got %s", "hello world 1", buf.String())
 	}
 }
+
+// TestStreamBlockedByNextUnblocksOnStorageClose tests that when a stream is waiting
+// on Next() and storage is closed, the Next() call should unblock and return an error.
+func TestStreamBlockedByNextUnblocksOnStorageClose(t *testing.T) {
+	storage, cleanup := createStorage(t, "./TestStreamBlockedByNextUnblocksOnStorageClose")
+	defer cleanup()
+
+	// Append one message
+	_, _, err := storage.Append(context.Background(), "default", strings.NewReader("hello world 0"))
+	if err != nil {
+		t.Fatalf("failed to append content: %v", err)
+	}
+
+	// Create a stream that starts from the latest position (will wait for new messages)
+	stream := storage.Stream(context.Background(), "default", -1)
+	defer stream.Done()
+
+	// Channel to track when the goroutine starts and completes
+	started := make(chan struct{})
+	errCh := make(chan error, 1)
+
+	// Start a goroutine that will block on Next()
+	go func() {
+		close(started) // Signal that we've started
+
+		// This should block because there are no new messages after the latest
+		ctx := context.Background()
+		r, _, err := stream.Next(ctx)
+		if r != nil {
+			r.Done()
+		}
+		errCh <- err
+	}()
+
+	// Wait for the goroutine to start
+	<-started
+
+	// Give it a moment to actually reach the blocking point
+	time.Sleep(100 * time.Millisecond)
+
+	// Close the storage while the goroutine is blocked on Next()
+	if err := storage.Close(); err != nil {
+		t.Fatalf("failed to close storage: %v", err)
+	}
+
+	// Wait for the Next() call to return with a timeout
+	select {
+	case err := <-errCh:
+		// Next() should return an error after storage is closed
+		if err == nil {
+			t.Fatal("expected Next() to return an error after storage close, got nil")
+		}
+		// The error should indicate that the storage was closed
+		t.Logf("Next() correctly returned error: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Next() did not unblock within 5 seconds after storage.Close()")
+	}
+}
+
+// TestMultipleStreamsUnblockOnStorageClose tests that multiple concurrent streams
+// all unblock when storage is closed.
+func TestMultipleStreamsUnblockOnStorageClose(t *testing.T) {
+	storage, cleanup := createStorage(t, "./TestMultipleStreamsUnblockOnStorageClose")
+	defer cleanup()
+
+	// Append one message
+	_, _, err := storage.Append(context.Background(), "default", bytes.NewReader([]byte("initial message")))
+	if err != nil {
+		t.Fatalf("failed to append content: %v", err)
+	}
+
+	streamCount := 5
+	errChs := make([]chan error, streamCount)
+
+	// Create multiple streams that will all block on Next()
+	for i := range streamCount {
+		errChs[i] = make(chan error, 1)
+
+		stream := storage.Stream(context.Background(), "default", -1)
+		defer stream.Done()
+
+		go func(idx int, s immuta.Stream) {
+			ctx := context.Background()
+			r, _, err := s.Next(ctx)
+			if r != nil {
+				r.Done()
+			}
+			errChs[idx] <- err
+		}(i, stream)
+	}
+
+	// Give all goroutines time to block
+	time.Sleep(100 * time.Millisecond)
+
+	// Close the storage
+	if err := storage.Close(); err != nil {
+		t.Fatalf("failed to close storage: %v", err)
+	}
+
+	// All streams should unblock
+	for i := range streamCount {
+		select {
+		case err := <-errChs[i]:
+			if err == nil {
+				t.Errorf("stream %d: expected error after close, got nil", i)
+			} else {
+				t.Logf("stream %d: correctly returned error: %v", i, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Errorf("stream %d: did not unblock within 5 seconds", i)
+		}
+	}
+}
+
+// TestStreamReadThenBlockThenClose tests a stream that successfully reads a message,
+// then blocks waiting for the next one, and should unblock when storage closes.
+func TestStreamReadThenBlockThenClose(t *testing.T) {
+	storage, cleanup := createStorage(t, "./TestStreamReadThenBlockThenClose")
+	defer cleanup()
+
+	// Append initial message
+	_, _, err := storage.Append(context.Background(), "default", strings.NewReader("message 0"))
+	if err != nil {
+		t.Fatalf("failed to append content: %v", err)
+	}
+
+	// Create stream from beginning
+	stream := storage.Stream(context.Background(), "default", 0)
+	defer stream.Done()
+
+	// Read the first message successfully
+	r, _, err := stream.Next(context.Background())
+	if err != nil {
+		t.Fatalf("failed to read first message: %v", err)
+	}
+	r.Done()
+
+	// Now try to read next message (which doesn't exist yet)
+	errCh := make(chan error, 1)
+	go func() {
+		ctx := context.Background()
+		r, _, err := stream.Next(ctx)
+		if r != nil {
+			r.Done()
+		}
+		errCh <- err
+	}()
+
+	// Give it time to block
+	time.Sleep(100 * time.Millisecond)
+
+	// Close storage
+	if err := storage.Close(); err != nil {
+		t.Fatalf("failed to close storage: %v", err)
+	}
+
+	// Should unblock with error
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected error after storage close, got nil")
+		}
+		t.Logf("correctly returned error: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Next() did not unblock within 5 seconds")
+	}
+}
+
+// TestStreamWithCancelledContextBeforeClose ensures context cancellation still works
+func TestStreamWithCancelledContextBeforeClose(t *testing.T) {
+	storage, cleanup := createStorage(t, "./TestStreamWithCancelledContextBeforeClose")
+	defer cleanup()
+
+	stream := storage.Stream(context.Background(), "default", 0)
+	defer stream.Done()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	r, _, err := stream.Next(ctx)
+	if r != nil {
+		r.Done()
+	}
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded, got: %v", err)
+	}
+}
