@@ -29,14 +29,10 @@ var (
 	ErrStorageClosed     = errors.New("storage is closed")
 )
 
-// Compressor is an interface for compression algorithms.
-// Implementations should handle compression and decompression of data.
-type Compressor interface {
-	// Compress takes a reader and returns a reader that compresses the data.
-	Compress(r io.Reader) (io.Reader, error)
-	// Decompress takes a reader and returns a reader that decompresses the data.
-	Decompress(r io.Reader) (io.Reader, error)
-}
+// Transformer transforms a reader into another reader.
+// This can be used for compression, encryption, or any other data transformation.
+// Multiple transformers can be chained together.
+type Transformer func(r io.Reader) (io.Reader, error)
 
 // Appender is a single method interface that writes the content of the reader to the storage medium.
 type Appender interface {
@@ -60,15 +56,16 @@ type Stream interface {
 //
 
 type storage struct {
-	w             *os.File
-	fds           chan *os.File
-	bc            *solid.Broadcast
-	currSize      int64
-	currCount     int64
-	lastIndex     int64
-	streamIdcount atomic.Int64
-	compressor    Compressor
-	closed        atomic.Bool
+	w              *os.File
+	fds            chan *os.File
+	bc             solid.Broadcast
+	currSize       int64
+	currCount      int64
+	lastIndex      int64
+	streamIdcount  atomic.Int64
+	closed         atomic.Bool
+	writeTransform Transformer // transforms data before writing
+	readTransform  Transformer // transforms data after reading
 }
 
 var _ Appender = (*storage)(nil)
@@ -77,7 +74,7 @@ func (s *storage) getFd(ctx context.Context) (*os.File, error) {
 	select {
 	case fd, ok := <-s.fds:
 		if !ok {
-			return nil, fmt.Errorf("no more file descriptors")
+			return nil, ErrStorageClosed
 		}
 		return fd, nil
 	case <-ctx.Done():
@@ -86,11 +83,18 @@ func (s *storage) getFd(ctx context.Context) (*os.File, error) {
 }
 
 func (s *storage) putFd(ctx context.Context, fd *os.File) error {
+	if s.closed.Load() {
+		// Storage is closed, don't try to put fd back
+		return nil
+	}
 	select {
 	case s.fds <- fd:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	default:
+		// Channel is full or closed, this shouldn't happen in normal operation
+		return nil
 	}
 }
 
@@ -114,6 +118,10 @@ func loadFileHeader(fd *os.File) (total int64, index int64, err error) {
 }
 
 func (s *storage) Details() (string, error) {
+	if s.closed.Load() {
+		return "", ErrStorageClosed
+	}
+
 	fd, err := s.getFd(context.Background())
 	if err != nil {
 		return "", err
@@ -129,6 +137,10 @@ func (s *storage) Details() (string, error) {
 }
 
 func (s *storage) Verify() error {
+	if s.closed.Load() {
+		return ErrStorageClosed
+	}
+
 	fd, err := s.getFd(context.Background())
 	if err != nil {
 		return err
@@ -179,15 +191,18 @@ func (s *storage) Verify() error {
 
 // Append should only be called by a single goroutine at a time. It is not safe for concurrent use.
 func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size int64, err error) {
+	if s.closed.Load() {
+		return -1, -1, ErrStorageClosed
+	}
+
 	defer func() {
 		// if there is an error, move the current position back to the original position
 		if err != nil {
 			// truncate the file to the original size
-			err = s.w.Truncate(s.currSize)
-			if err != nil {
-				err = fmt.Errorf("failed to truncate the file: %w", err)
+			truncErr := s.w.Truncate(s.currSize)
+			if truncErr != nil {
+				err = errors.Join(err, fmt.Errorf("failed to truncate the file: %w", truncErr))
 			}
-
 			return
 		}
 
@@ -229,23 +244,21 @@ func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 	}
 
 	// write header first
-	//
 	_, err = s.w.Write(emptyRecordHeader)
 	if err != nil {
 		return -1, -1, err
 	}
 
-	// compress the content if compressor is provided
+	// Apply write transform if provided
 	var contentReader io.Reader = r
-	if s.compressor != nil {
-		contentReader, err = s.compressor.Compress(r)
+	if s.writeTransform != nil {
+		contentReader, err = s.writeTransform(r)
 		if err != nil {
-			return -1, -1, fmt.Errorf("failed to compress content: %w", err)
+			return -1, -1, fmt.Errorf("failed to transform content: %w", err)
 		}
 	}
 
 	// copy the content
-	//
 	size, err = io.Copy(s.w, contentReader)
 	if err != nil {
 		return -1, -1, err
@@ -254,14 +267,12 @@ func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 	currSize := s.currSize + size + RecordHeaderSize
 
 	// Move back to the header of the content
-	//
 	_, err = s.w.Seek(currSize-(size+RecordHeaderSize), io.SeekStart)
 	if err != nil {
 		return -1, -1, err
 	}
 
 	// write the size of the content
-	//
 	err = binary.Write(s.w, binary.LittleEndian, size)
 	if err != nil {
 		return -1, -1, err
@@ -276,16 +287,16 @@ func (s *storage) Close() error {
 		return nil // Already closed
 	}
 
+	// Close the broadcast first to wake up all waiting streams
+	s.bc.Close()
+
 	// Close all file descriptor readers
 	close(s.fds)
-	for range cap(s.fds) {
-		fd := <-s.fds
+	for fd := range s.fds {
 		if err := fd.Close(); err != nil {
 			return err
 		}
 	}
-
-	s.bc.Close()
 
 	return s.w.Close()
 }
@@ -294,18 +305,18 @@ func (s *storage) Close() error {
 // Stream(ctx, -1) 	-> start from latest messages
 // Stream(ctx, 10) 	-> start after 10nth message
 //
-// NOTE: Creating a stream does not block the storage from writing new messages can it is concurrent safe.
+// NOTE: Creating a stream does not block the storage from writing new messages and it is concurrent safe.
 func (s *storage) Stream(ctx context.Context, startPos int64) Stream {
 	return &stream{
-		id:         s.streamIdcount.Add(1),
-		index:      -1,
-		startPos:   startPos,
-		getFd:      s.getFd,
-		putFd:      s.putFd,
-		getLast:    s.getLastIndex,
-		isClosed:   func() bool { return s.closed.Load() },
-		signal:     s.bc.CreateSignal(solid.WithHistory(startPos)),
-		compressor: s.compressor,
+		id:            s.streamIdcount.Add(1),
+		index:         -1,
+		startPos:      startPos,
+		getFd:         s.getFd,
+		putFd:         s.putFd,
+		getLast:       s.getLastIndex,
+		isClosed:      func() bool { return s.closed.Load() },
+		signal:        s.bc.CreateSignal(solid.WithHistory(startPos)),
+		readTransform: s.readTransform,
 	}
 }
 
@@ -315,13 +326,21 @@ func (s *storage) getLastIndex() int64 {
 
 type Storage struct {
 	mapper map[string]*storage
+	closed atomic.Bool
 }
 
 func (s *Storage) Close() error {
+	if s.closed.Swap(true) {
+		return nil // Already closed
+	}
+	var errs []error
 	for _, st := range s.mapper {
 		if err := st.Close(); err != nil {
-			return err
+			errs = append(errs, err)
 		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 	return nil
 }
@@ -375,11 +394,12 @@ func (s *Storage) Verify(namespace string) error {
 }
 
 type options struct {
-	logsDirPath string
-	readerCount int
-	fastWrite   bool
-	namespaces  []string
-	compressor  Compressor
+	logsDirPath    string
+	readerCount    int
+	fastWrite      bool
+	namespaces     []string
+	writeTransform Transformer
+	readTransform  Transformer
 }
 
 type OptionFunc func(*options) error
@@ -416,10 +436,39 @@ func WithNamespaces(namespaces ...string) OptionFunc {
 	}
 }
 
-func WithCompression(compressor Compressor) OptionFunc {
+// WithWriteTransform sets a transformer to be applied when writing data.
+// This can be used for compression, encryption, etc.
+func WithWriteTransform(t Transformer) OptionFunc {
 	return func(o *options) error {
-		o.compressor = compressor
+		o.writeTransform = t
 		return nil
+	}
+}
+
+// WithReadTransform sets a transformer to be applied when reading data.
+// This can be used for decompression, decryption, etc.
+func WithReadTransform(t Transformer) OptionFunc {
+	return func(o *options) error {
+		o.readTransform = t
+		return nil
+	}
+}
+
+// ChainTransformers chains multiple transformers together.
+// Transformers are applied in order.
+func ChainTransformers(transformers ...Transformer) Transformer {
+	return func(r io.Reader) (io.Reader, error) {
+		var err error
+		for _, t := range transformers {
+			if t == nil {
+				continue
+			}
+			r, err = t(r)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return r, nil
 	}
 }
 
@@ -449,8 +498,12 @@ func New(optFns ...OptionFunc) (*Storage, error) {
 	mapper := make(map[string]*storage, len(o.namespaces))
 	for _, namespace := range o.namespaces {
 		logFile := filepath.Join(o.logsDirPath, fmt.Sprintf("%s.log", namespace))
-		st, err := new(logFile, o.readerCount, o.fastWrite, o.compressor)
+		st, err := newStorage(logFile, o.readerCount, o.fastWrite, o.writeTransform, o.readTransform)
 		if err != nil {
+			// Close any already opened storages
+			for _, opened := range mapper {
+				opened.Close()
+			}
 			return nil, err
 		}
 		mapper[namespace] = st
@@ -461,7 +514,7 @@ func New(optFns ...OptionFunc) (*Storage, error) {
 	}, nil
 }
 
-func new(filepath string, readerCount int, fastWrite bool, compressor Compressor) (*storage, error) {
+func newStorage(filepath string, readerCount int, fastWrite bool, writeTransform, readTransform Transformer) (*storage, error) {
 	if readerCount <= 0 {
 		return nil, fmt.Errorf("readerCount must be greater than 0")
 	}
@@ -481,70 +534,79 @@ func new(filepath string, readerCount int, fastWrite bool, compressor Compressor
 
 	size, err := getSize(w)
 	if err != nil {
+		w.Close()
 		return nil, err
 	}
 
 	if size == 0 {
 		_, err = w.Write(emptyFileHeader)
 		if err != nil {
+			w.Close()
 			return nil, err
 		}
 	}
 
 	_, err = w.Seek(0, io.SeekStart)
 	if err != nil {
+		w.Close()
 		return nil, err
 	}
 
-	//
 	// read the first 8 bytes to get the number of messages
-	//
-
 	var count int64
 	err = binary.Read(w, binary.LittleEndian, &count)
 	if err != nil {
+		w.Close()
 		return nil, err
 	}
 
 	// read the next 8 bytes to get the index of the last message
-
 	var lastIndex int64
 	err = binary.Read(w, binary.LittleEndian, &lastIndex)
 	if err != nil {
+		w.Close()
 		return nil, err
 	}
 
 	// move the cursor to the end of the file
-
 	size, err = getSize(w)
 	if err != nil {
+		w.Close()
 		return nil, err
 	}
 
 	_, err = w.Seek(size, io.SeekStart)
 	if err != nil {
+		w.Close()
 		return nil, err
 	}
 
-	storage := &storage{
-		w:          w,
-		fds:        make(chan *os.File, readerCount),
-		bc:         solid.NewBroadcast(solid.WithInitialTotal(count)),
-		currSize:   size,
-		currCount:  count,
-		lastIndex:  lastIndex,
-		compressor: compressor,
+	st := &storage{
+		w:              w,
+		fds:            make(chan *os.File, readerCount),
+		bc:             solid.NewBroadcastCond(solid.WithInitialTotal(count)),
+		currSize:       size,
+		currCount:      count,
+		lastIndex:      lastIndex,
+		writeTransform: writeTransform,
+		readTransform:  readTransform,
 	}
 
 	for i := 0; i < readerCount; i++ {
 		fd, err := os.Open(filepath)
 		if err != nil {
+			// Close already opened fds
+			close(st.fds)
+			for fd := range st.fds {
+				fd.Close()
+			}
+			w.Close()
 			return nil, err
 		}
-		storage.fds <- fd
+		st.fds <- fd
 	}
 
-	return storage, nil
+	return st, nil
 }
 
 func getSize(w *os.File) (int64, error) {
@@ -560,15 +622,15 @@ func getSize(w *os.File) (int64, error) {
 //
 
 type stream struct {
-	id         int64
-	index      int64
-	startPos   int64
-	getFd      func(context.Context) (*os.File, error)
-	putFd      func(context.Context, *os.File) error
-	getLast    func() int64
-	isClosed   func() bool
-	signal     *solid.Signal
-	compressor Compressor
+	id            int64
+	index         int64
+	startPos      int64
+	getFd         func(context.Context) (*os.File, error)
+	putFd         func(context.Context, *os.File) error
+	getLast       func() int64
+	isClosed      func() bool
+	signal        solid.Signal
+	readTransform Transformer
 }
 
 func (s *stream) String() string {
@@ -581,7 +643,10 @@ func (s *stream) findIndex(fd *os.File) (int64, error) {
 	// moved to the beginning of the file
 	// to read the total number of messages
 
-	fd.Seek(0, io.SeekStart)
+	_, err := fd.Seek(0, io.SeekStart)
+	if err != nil {
+		return -1, err
+	}
 
 	total, _, err := loadFileHeader(fd)
 	if err != nil {
@@ -624,10 +689,7 @@ func (s *stream) Next(ctx context.Context) (r *Reader, size int64, err error) {
 			return
 		}
 
-		putFdErr := s.putFd(context.WithoutCancel(ctx), fd)
-		if putFdErr != nil {
-			err = errors.Join(err, fmt.Errorf("failed to put fd: %w", putFdErr))
-		}
+		_ = s.putFd(context.WithoutCancel(ctx), fd)
 	}()
 
 	for {
@@ -637,9 +699,11 @@ func (s *stream) Next(ctx context.Context) (r *Reader, size int64, err error) {
 		}
 
 		err = s.signal.Wait(ctx)
-		if errors.Is(err, solid.ErrSignalNotAvailable) {
-			return nil, -1, ErrStorageClosed
-		} else if err != nil {
+		if err != nil {
+			// Check if the error is because broadcast is closed
+			if errors.Is(err, solid.ErrSignalNotAvailable) {
+				return nil, -1, ErrStorageClosed
+			}
 			return nil, -1, err
 		}
 
@@ -677,8 +741,8 @@ func (s *stream) Next(ctx context.Context) (r *Reader, size int64, err error) {
 		}
 
 		return &Reader{
-			r:          io.LimitReader(fd, size),
-			compressor: s.compressor,
+			r:             io.LimitReader(fd, size),
+			readTransform: s.readTransform,
 			done: func() error {
 				s.index += size + RecordHeaderSize
 				return s.putFd(ctx, fd)
@@ -697,28 +761,28 @@ func (s *stream) Done() {
 
 type Reader struct {
 	r             io.Reader
-	compressor    Compressor
-	decompressed  io.Reader
+	readTransform Transformer
+	transformed   io.Reader
 	done          func() error
-	decompressErr error
+	transformErr  error
 }
 
 var _ io.Reader = (*Reader)(nil)
 
 func (r *Reader) Read(p []byte) (n int, err error) {
-	// If compression is enabled and we haven't decompressed yet, do it now
-	if r.compressor != nil && r.decompressed == nil && r.decompressErr == nil {
-		r.decompressed, r.decompressErr = r.compressor.Decompress(r.r)
+	// If transform is enabled and we haven't transformed yet, do it now
+	if r.readTransform != nil && r.transformed == nil && r.transformErr == nil {
+		r.transformed, r.transformErr = r.readTransform(r.r)
 	}
 
-	// If we had an error during decompression, return it
-	if r.decompressErr != nil {
-		return 0, r.decompressErr
+	// If we had an error during transformation, return it
+	if r.transformErr != nil {
+		return 0, r.transformErr
 	}
 
-	// Read from decompressed reader if available, otherwise from raw reader
-	if r.decompressed != nil {
-		return r.decompressed.Read(p)
+	// Read from transformed reader if available, otherwise from raw reader
+	if r.transformed != nil {
+		return r.transformed.Read(p)
 	}
 
 	return r.r.Read(p)
