@@ -6,32 +6,44 @@
 ██║██║░╚═╝░██║██║░╚═╝░██║╚██████╔╝░░░██║░░░██║░░██║
 ╚═╝╚═╝░░░░░╚═╝╚═╝░░░░░╚═╝░╚═════╝░░░░╚═╝░░░╚═╝░░╚═╝
 ```
+<div align="center">
 
-Immuta is a `Append Only Log` implementation based on single writer, multiple readers concept. It uses filesystem as it's core the format of the each record is as follows and uses [solid](https://ella.to/solid) for io signgling
+[![Go Reference](https://pkg.go.dev/badge/ella.to/immuta.svg)](https://pkg.go.dev/ella.to/immuta)
+[![Go Report Card](https://goreportcard.com/badge/ella.to/immuta)](https://goreportcard.com/report/ella.to/immuta)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-- the first 8 bytes provide the number of messages in the log file
-- loop
-  - the next 8 bytes define the size of the payload (Header)
-  - payload can be any arbitrary size
+**Immuta** is a high-performance append-only log implementation based on a single writer, multiple readers architecture. It uses the filesystem as its storage backend and [solid](https://ella.to/solid) for signaling.
+
+</div>
+
+## Features
+
+- **Single Writer, Multiple Readers** - Optimized for append-only workloads with concurrent read access
+- **Namespace Isolation** - Data is isolated in separate files per namespace
+- **Pluggable Transformers** - Support for compression, encryption, or any custom data transformation
+- **Chainable Transformers** - Multiple transformations can be chained together
+
+## File Format
 
 ```
-+----------+----------+---------------+----------+---------------+
-|          |          |               |          |               |
-| MESSAGES |  PAYLOAD |    PAYLOAD    |  PAYLOAD |    PAYLOAD    | ...
-|   COUNT  |   SIZE   |               |   SIZE   |               |
-+----------+----------+---------------+----------+---------------+
-   8 bytes   8 bytes                    8 bytes
++----------+----------+----------+---------------+----------+---------------+
+|          |          |          |               |          |               |
+| MESSAGES |  LAST    |  PAYLOAD |    PAYLOAD    |  PAYLOAD |    PAYLOAD    | ...
+|   COUNT  |  INDEX   |   SIZE   |               |   SIZE   |               |
++----------+----------+----------+---------------+----------+---------------+
+   8 bytes   8 bytes    8 bytes                    8 bytes
+            (Header)             (Record 1)                  (Record 2)
 ```
 
-# Installation
+## Installation
 
 ```bash
 go get ella.to/immuta
 ```
 
-# Usgae
+## Quick Start
 
-```golang
+```go
 package main
 
 import (
@@ -46,215 +58,319 @@ import (
 )
 
 func main() {
-	logDir := "./log-data"
-	poolFileDescriptor := 10
-	// fastwrite uses the buffer for each append
-	// if you need gurrantee on saving on disk, enable set fastWrite to false
-	// the Append operation will get the performance hit
-	fastWrite := true
-
-	// namespace is isolating the data in it's own file which managed by immuta
-	namespace := "default"
-
+	// Create storage with a namespace
 	log, err := immuta.New(
-		immuta.WithLogsDirPath(logDir),
-		immuta.WithReaderCount(poolFileDescriptor),
-		immuta.WithFastWrite(fastWrite),
-		immuta.WithNamespaces(namespace),
+		immuta.WithLogsDirPath("./log-data"),
+		immuta.WithReaderCount(10),      // Pool of file descriptors for readers
+		immuta.WithFastWrite(true),      // Use buffered writes (faster but less durable)
+		immuta.WithNamespaces("events"), // Create a namespace called "events"
 	)
 	if err != nil {
 		panic(err)
 	}
 	defer log.Close()
 
+	// Write data
 	content := []byte("hello world")
-
-	// write to append only log
-	index, size, err := log.Append(context.Background(), namespace, bytes.NewReader(content))
+	index, size, err := log.Append(context.Background(), "events", bytes.NewReader(content))
 	if err != nil {
 		panic(err)
 	}
+	fmt.Printf("Written at index %d, size %d bytes\n", index, size)
 
-	if index != 8 {
-		panic("index must be 8")
-	}
-
-	if size != 11 {
-		panic("size must be 11")
-	}
-
-	// 0: start from beginning
-	// negative value: start from latest append
-	// positive number: skip those message
-	var startPos int64 = 0
-
-	// this call doesn't allocate any file descriptor yet
-	stream := log.Stream(context.Background(), namespace, startPos)
+	// Read data using a stream
+	stream := log.Stream(context.Background(), "events", 0) // 0 = start from beginning
 	defer stream.Done()
 
-	for {
-		var buffer bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
-		err := func() error {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-
-			r, size, err := stream.Next(ctx)
-			if err != nil {
-				return err
-			}
-			// important: don't forget to call Done() to release the file descriptor
-			defer r.Done()
-
-			buffer.Reset()
-
-			_, err = io.Copy(&buffer, r)
-			if err != nil {
-				return err
-			}
-
-			fmt.Printf("size of the record: %d\n", size)
-			fmt.Printf("content: %s\n", buffer.String())
-
-			return nil
-		}()
-
+	r, size, err := stream.Next(ctx)
+	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			break
-		} else if err != nil {
-			panic(err)
+			fmt.Println("No more messages")
+			return
 		}
+		panic(err)
+	}
+	defer r.Done() // Important: release the file descriptor
+
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	fmt.Printf("Read: %s (size: %d)\n", buf.String(), size)
+}
+```
+
+## Configuration Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `WithLogsDirPath(path)` | Directory for log files | `"./logs"` |
+| `WithReaderCount(n)` | Number of pooled file descriptors for concurrent reads | `5` |
+| `WithFastWrite(bool)` | Use buffered writes (faster) or sync writes (more durable) | `true` |
+| `WithNamespaces(names...)` | Create one or more namespaces | Required |
+| `WithWriteTransform(t)` | Transform data before writing | `nil` |
+| `WithReadTransform(t)` | Transform data after reading | `nil` |
+
+## Stream Positioning
+
+When creating a stream, the `startPos` parameter controls where reading begins:
+
+```go
+// Start from the beginning (read all messages)
+stream := log.Stream(ctx, "events", 0)
+
+// Start from the latest (only new messages)
+stream := log.Stream(ctx, "events", -1)
+
+// Skip the first N messages
+stream := log.Stream(ctx, "events", 10) // Skip first 10 messages
+```
+
+## Data Transformers
+
+Transformers allow you to modify data as it's written or read. Common use cases include compression and encryption.
+
+### Transformer Type
+
+```go
+type Transformer func(r io.Reader) (io.Reader, error)
+```
+
+### Compression Example
+
+```go
+import (
+	"bytes"
+	"compress/flate"
+	"io"
+	"ella.to/immuta"
+)
+
+// Compress transforms data by compressing it
+func Compress(level int) immuta.Transformer {
+	return func(r io.Reader) (io.Reader, error) {
+		var buf bytes.Buffer
+		w, err := flate.NewWriter(&buf, level)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := io.Copy(w, r); err != nil {
+			w.Close()
+			return nil, err
+		}
+		if err := w.Close(); err != nil {
+			return nil, err
+		}
+		return &buf, nil
 	}
 }
-```
 
-# Compression
+// Decompress transforms data by decompressing it
+func Decompress() immuta.Transformer {
+	return func(r io.Reader) (io.Reader, error) {
+		return flate.NewReader(r), nil
+	}
+}
 
-The `immuta` library supports pluggable compression through the `Compressor` interface. This allows you to use any compression algorithm you prefer, such as:
-
-- Standard library algorithms (flate, gzip, zlib, lzw)
-- Third-party algorithms (s2, snappy, zstd, lz4, etc.)
-
-## Compressor Interface
-
-To implement compression, you need to provide a type that implements the `Compressor` interface:
-
-```go
-type Compressor interface {
-    // Compress takes a reader and returns a reader that compresses the data.
-    Compress(r io.Reader) (io.Reader, error)
-    // Decompress takes a reader and returns a reader that decompresses the data.
-    Decompress(r io.Reader) (io.Reader, error)
+func main() {
+	log, _ := immuta.New(
+		immuta.WithLogsDirPath("./logs"),
+		immuta.WithNamespaces("compressed"),
+		immuta.WithWriteTransform(Compress(flate.BestSpeed)),
+		immuta.WithReadTransform(Decompress()),
+	)
+	defer log.Close()
+	
+	// Data is automatically compressed on write and decompressed on read
 }
 ```
 
-## Example Implementation
+### Chaining Transformers
 
-This example shows how to implement the `Compressor` interface using `compress/flate` from the standard library:
-
-```go
-type FlateCompressor struct {
-    level int
-}
-
-func (c *FlateCompressor) Compress(r io.Reader) (io.Reader, error) {
-    var buf bytes.Buffer
-    w, err := flate.NewWriter(&buf, c.level)
-    if err != nil {
-        return nil, err
-    }
-
-    _, err = io.Copy(w, r)
-    if err != nil {
-        w.Close()
-        return nil, err
-    }
-
-    err = w.Close()
-    if err != nil {
-        return nil, err
-    }
-
-    return &buf, nil
-}
-
-func (c *FlateCompressor) Decompress(r io.Reader) (io.Reader, error) {
-    return flate.NewReader(r), nil
-}
-```
-
-## Usage
-
-To enable compression, simply pass your compressor implementation to the `WithCompression` option:
+Multiple transformers can be chained together. They are applied in order:
 
 ```go
-compressor := NewFlateCompressor(flate.BestSpeed)
+// Chain compression and then encryption on write
+writeChain := immuta.ChainTransformers(
+	Compress(flate.BestSpeed),
+	Encrypt(key),
+)
 
-log, err := immuta.New(
-    immuta.WithLogsDirPath(logDir),
-    immuta.WithReaderCount(poolFileDescriptor),
-    immuta.WithFastWrite(fastWrite),
-    immuta.WithNamespaces(namespace),
-    immuta.WithCompression(compressor), // Enable compression
+// Chain decryption and then decompression on read (reverse order)
+readChain := immuta.ChainTransformers(
+	Decrypt(key),
+	Decompress(),
+)
+
+log, _ := immuta.New(
+	immuta.WithLogsDirPath("./logs"),
+	immuta.WithNamespaces("secure"),
+	immuta.WithWriteTransform(writeChain),
+	immuta.WithReadTransform(readChain),
 )
 ```
 
-Once configured, all data written via `Append()` will be automatically compressed, and all data read via `Stream()` will be automatically decompressed. The compression is transparent to your application code.
+### Using Third-Party Libraries
 
-## Using Third-Party Compression Libraries
-
-You can use any compression library by implementing the `Compressor` interface. For example, to use `github.com/klauspost/compress/s2`:
+You can use any compression or encryption library by wrapping it in a `Transformer`:
 
 ```go
 import "github.com/klauspost/compress/s2"
 
-type S2Compressor struct{}
-
-func (c *S2Compressor) Compress(r io.Reader) (io.Reader, error) {
-    var buf bytes.Buffer
-    w := s2.NewWriter(&buf)
-    
-    _, err := io.Copy(w, r)
-    if err != nil {
-        w.Close()
-        return nil, err
-    }
-    
-    err = w.Close()
-    if err != nil {
-        return nil, err
-    }
-    
-    return &buf, nil
+func S2Compress() immuta.Transformer {
+	return func(r io.Reader) (io.Reader, error) {
+		var buf bytes.Buffer
+		w := s2.NewWriter(&buf)
+		if _, err := io.Copy(w, r); err != nil {
+			w.Close()
+			return nil, err
+		}
+		if err := w.Close(); err != nil {
+			return nil, err
+		}
+		return &buf, nil
+	}
 }
 
-func (c *S2Compressor) Decompress(r io.Reader) (io.Reader, error) {
-    return s2.NewReader(r), nil
+func S2Decompress() immuta.Transformer {
+	return func(r io.Reader) (io.Reader, error) {
+		return s2.NewReader(r), nil
+	}
 }
 ```
 
-# Performance
+## Error Handling
 
-- Appending 100k records of 1kb took around 1 seconds
+Immuta provides specific error types:
 
-```
-go test -benchmem -run=^$ -bench ^Benchmark1kbAppend$ ella.to/immuta
-
-goos: darwin
-goarch: arm64
-pkg: ella.to/immuta
-cpu: Apple M2 Pro
-Benchmark1kbAppend-12             119136             10111 ns/op              56 B/op          2 allocs/op
+```go
+var (
+	ErrNamespaceRequired = errors.New("namespace is required")
+	ErrNamesapceNotFound = errors.New("namespace not found")
+	ErrStorageClosed     = errors.New("storage is closed")
+)
 ```
 
-- Reading the 100k record is under 150ms
+When storage is closed, any blocked `stream.Next()` calls will unblock and return `ErrStorageClosed`.
 
+## Complete Example
+
+```go
+package main
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"sync"
+	"time"
+
+	"ella.to/immuta"
+)
+
+func main() {
+	log, err := immuta.New(
+		immuta.WithLogsDirPath("./log-data"),
+		immuta.WithReaderCount(10),
+		immuta.WithFastWrite(true),
+		immuta.WithNamespaces("events"),
+	)
+	if err != nil {
+		panic(err)
+	}
+	defer log.Close()
+
+	var wg sync.WaitGroup
+
+	// Writer goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			msg := fmt.Sprintf("message %d", i)
+			_, _, err := log.Append(context.Background(), "events", bytes.NewReader([]byte(msg)))
+			if err != nil {
+				fmt.Printf("Write error: %v\n", err)
+				return
+			}
+		}
+	}()
+
+	// Reader goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		stream := log.Stream(context.Background(), "events", 0)
+		defer stream.Done()
+
+		count := 0
+		for count < 100 {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			r, _, err := stream.Next(ctx)
+			cancel()
+
+			if errors.Is(err, context.DeadlineExceeded) {
+				break
+			}
+			if err != nil {
+				fmt.Printf("Read error: %v\n", err)
+				return
+			}
+
+			var buf bytes.Buffer
+			io.Copy(&buf, r)
+			r.Done()
+
+			count++
+		}
+		fmt.Printf("Read %d messages\n", count)
+	}()
+
+	wg.Wait()
+}
 ```
-go test -timeout 30s -run ^TestRead100kMessages$ ella.to/immuta -v
-=== RUN   TestRead100kMessages
-=== PAUSE TestRead100kMessages
-=== CONT  TestRead100kMessages
-time taken to write 100000: 925.566167ms
-time taken to read 100000: 148.137541ms
---- PASS: TestRead100kMessages (1.07s)
+
+## Performance
+
+Benchmarks on Apple M2 Pro:
+
+### Write Performance
+
+| Message Size | Throughput | Allocations |
+|--------------|------------|-------------|
+| 100 bytes | ~17 MB/s | 2 allocs/op |
+| 1 KB | ~160 MB/s | 2 allocs/op |
+| 4 KB | ~450 MB/s | 2 allocs/op |
+| 64 KB | ~4 GB/s | 2 allocs/op |
+
+### Read Performance
+
+| Message Size | Throughput | Allocations |
+|--------------|------------|-------------|
+| 1 KB | ~686 MB/s | 6 allocs/op |
+
+### Bulk Operations
+
+- Writing 100k records of 1KB: ~1.2 seconds
+- Reading 100k records of 1KB: ~335ms
+
+```bash
+# Run benchmarks
+go test -bench=. -benchmem
+
+# Run with race detector
+go test -race ./...
 ```
+
+## Thread Safety
+
+- **Append**: Should be called from a single goroutine (not safe for concurrent writes)
+- **Stream**: Safe for concurrent use; multiple streams can read simultaneously
+- **Close**: Safe to call multiple times; properly unblocks waiting streams
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.
