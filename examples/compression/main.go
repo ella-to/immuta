@@ -12,43 +12,35 @@ import (
 	"ella.to/immuta"
 )
 
-// FlateCompressor implements immuta.Compressor using compress/flate from the standard library.
-type FlateCompressor struct {
-	level int
+// FlateCompress returns a Transformer that compresses data using flate.
+func FlateCompress(level int) immuta.Transformer {
+	return func(r io.Reader) (io.Reader, error) {
+		var buf bytes.Buffer
+		w, err := flate.NewWriter(&buf, level)
+		if err != nil {
+			return nil, err
+		}
+
+		_, err = io.Copy(w, r)
+		if err != nil {
+			w.Close()
+			return nil, err
+		}
+
+		err = w.Close()
+		if err != nil {
+			return nil, err
+		}
+
+		return &buf, nil
+	}
 }
 
-// NewFlateCompressor creates a new FlateCompressor with the specified compression level.
-// level can be from -2 (HuffmanOnly) to 9 (BestCompression).
-// Use flate.DefaultCompression (-1) for a balance between speed and compression.
-func NewFlateCompressor(level int) *FlateCompressor {
-	return &FlateCompressor{level: level}
-}
-
-// Compress compresses the data from the reader.
-func (c *FlateCompressor) Compress(r io.Reader) (io.Reader, error) {
-	var buf bytes.Buffer
-	w, err := flate.NewWriter(&buf, c.level)
-	if err != nil {
-		return nil, err
+// FlateDecompress returns a Transformer that decompresses flate data.
+func FlateDecompress() immuta.Transformer {
+	return func(r io.Reader) (io.Reader, error) {
+		return flate.NewReader(r), nil
 	}
-
-	_, err = io.Copy(w, r)
-	if err != nil {
-		w.Close()
-		return nil, err
-	}
-
-	err = w.Close()
-	if err != nil {
-		return nil, err
-	}
-
-	return &buf, nil
-}
-
-// Decompress decompresses the data from the reader.
-func (c *FlateCompressor) Decompress(r io.Reader) (io.Reader, error) {
-	return flate.NewReader(r), nil
 }
 
 func main() {
@@ -57,15 +49,17 @@ func main() {
 	fastWrite := true
 	namespace := "default"
 
-	// Create a compressor using flate from the standard library
-	compressor := NewFlateCompressor(flate.BestSpeed)
+	// Create transformers using flate from the standard library
+	compressTransform := FlateCompress(flate.BestSpeed)
+	decompressTransform := FlateDecompress()
 
 	log, err := immuta.New(
 		immuta.WithLogsDirPath(logDir),
 		immuta.WithReaderCount(poolFileDescriptor),
 		immuta.WithFastWrite(fastWrite),
 		immuta.WithNamespaces(namespace),
-		immuta.WithCompression(compressor), // Enable compression
+		immuta.WithWriteTransform(compressTransform),  // Compress on write
+		immuta.WithReadTransform(decompressTransform), // Decompress on read
 	)
 	if err != nil {
 		panic(err)
