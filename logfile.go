@@ -117,16 +117,16 @@ func loadFileHeader(fd *os.File) (total int64, index int64, err error) {
 	return total, index, nil
 }
 
-func (s *storage) Details() (string, error) {
+func (s *storage) Details(ctx context.Context) (string, error) {
 	if s.closed.Load() {
 		return "", ErrStorageClosed
 	}
 
-	fd, err := s.getFd(context.Background())
+	fd, err := s.getFd(ctx)
 	if err != nil {
 		return "", err
 	}
-	defer s.putFd(context.Background(), fd)
+	defer s.putFd(ctx, fd)
 
 	stat, err := fd.Stat()
 	if err != nil {
@@ -136,16 +136,16 @@ func (s *storage) Details() (string, error) {
 	return fmt.Sprintf("size: %d, count: %d", stat.Size(), s.currCount), nil
 }
 
-func (s *storage) Verify() error {
+func (s *storage) Verify(ctx context.Context) error {
 	if s.closed.Load() {
 		return ErrStorageClosed
 	}
 
-	fd, err := s.getFd(context.Background())
+	fd, err := s.getFd(ctx)
 	if err != nil {
 		return err
 	}
-	defer s.putFd(context.Background(), fd)
+	defer s.putFd(ctx, fd)
 
 	stat, err := fd.Stat()
 	if err != nil {
@@ -375,22 +375,22 @@ func (s *Storage) Stream(ctx context.Context, namespace string, startPos int64) 
 	return st.Stream(ctx, startPos)
 }
 
-func (s *Storage) Details(namespace string) (string, error) {
+func (s *Storage) Details(ctx context.Context, namespace string) (string, error) {
 	st, err := s.getStorageByNamespace(namespace)
 	if err != nil {
 		return "", err
 	}
 
-	return st.Details()
+	return st.Details(ctx)
 }
 
-func (s *Storage) Verify(namespace string) error {
+func (s *Storage) Verify(ctx context.Context, namespace string) error {
 	st, err := s.getStorageByNamespace(namespace)
 	if err != nil {
 		return err
 	}
 
-	return st.Verify()
+	return st.Verify(ctx)
 }
 
 type options struct {
@@ -682,22 +682,13 @@ func (s *stream) findIndex(fd *os.File) (int64, error) {
 }
 
 func (s *stream) Next(ctx context.Context) (r *Reader, size int64, err error) {
-	var fd *os.File
-
-	defer func() {
-		if err == nil || fd == nil {
-			return
-		}
-
-		_ = s.putFd(context.WithoutCancel(ctx), fd)
-	}()
-
 	for {
 		// Check if storage is closed before waiting
 		if s.isClosed() {
 			return nil, -1, ErrStorageClosed
 		}
 
+		// Wait for signal WITHOUT holding an FD - this allows unlimited concurrent streams
 		err = s.signal.Wait(ctx)
 		if err != nil {
 			// Check if the error is because broadcast is closed
@@ -712,34 +703,40 @@ func (s *stream) Next(ctx context.Context) (r *Reader, size int64, err error) {
 			return nil, -1, ErrStorageClosed
 		}
 
-		fd, err = s.getFd(ctx)
+		// NOW acquire FD only when we need to read
+		fd, err := s.getFd(ctx)
 		if err != nil {
 			return nil, -1, err
 		}
 
+		// Initialize index on first read
 		if s.index == -1 {
 			s.index, err = s.findIndex(fd)
 			if err != nil {
+				_ = s.putFd(context.WithoutCancel(ctx), fd)
 				return nil, -1, err
 			}
 		}
 
+		// Seek to current position
 		_, err = fd.Seek(s.index, io.SeekStart)
 		if err != nil {
+			_ = s.putFd(context.WithoutCancel(ctx), fd)
 			return nil, -1, fmt.Errorf("failed to seek to index %d, id: %d: %w", s.index, s.id, err)
 		}
 
+		// Read the size of the next message
 		err = binary.Read(fd, binary.LittleEndian, &size)
 		if errors.Is(err, io.EOF) {
-			if putErr := s.putFd(context.WithoutCancel(ctx), fd); putErr != nil {
-				return nil, -1, fmt.Errorf("failed to put fd: %w", putErr)
-			}
-			fd = nil
+			// No data available yet, release FD and wait for next signal
+			_ = s.putFd(context.WithoutCancel(ctx), fd)
 			continue
 		} else if err != nil {
+			_ = s.putFd(context.WithoutCancel(ctx), fd)
 			return nil, -1, fmt.Errorf("failed to read size of content at %d, id: %d: %w", s.index, s.id, err)
 		}
 
+		// Success - return Reader that will release FD when done
 		return &Reader{
 			r:             io.LimitReader(fd, size),
 			readTransform: s.readTransform,

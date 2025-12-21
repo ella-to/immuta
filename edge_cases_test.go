@@ -356,6 +356,8 @@ func TestInvalidNamespace(t *testing.T) {
 func TestVerifyAfterAppend(t *testing.T) {
 	t.Parallel()
 
+	ctx := t.Context()
+
 	storage, cleanup := createStorage(t, "./TestVerifyAfterAppend")
 	defer cleanup()
 
@@ -366,7 +368,7 @@ func TestVerifyAfterAppend(t *testing.T) {
 		}
 	}
 
-	if err := storage.Verify("default"); err != nil {
+	if err := storage.Verify(ctx, "default"); err != nil {
 		t.Fatalf("verification failed: %v", err)
 	}
 }
@@ -461,7 +463,7 @@ func TestStorageReopenAfterClose(t *testing.T) {
 		t.Fatalf("failed to append after reopen: %v", err)
 	}
 
-	if err := storage2.Verify("default"); err != nil {
+	if err := storage2.Verify(t.Context(), "default"); err != nil {
 		t.Fatalf("verification failed after reopen: %v", err)
 	}
 }
@@ -498,7 +500,7 @@ func TestMultipleNamespaces(t *testing.T) {
 
 	// Verify each namespace
 	for _, ns := range namespaces {
-		if err := storage.Verify(ns); err != nil {
+		if err := storage.Verify(t.Context(), ns); err != nil {
 			t.Fatalf("verification failed for %s: %v", ns, err)
 		}
 	}
@@ -542,7 +544,7 @@ func TestDetailsAfterClose(t *testing.T) {
 
 	storage.Close()
 
-	_, err := storage.Details("default")
+	_, err := storage.Details(t.Context(), "default")
 	if !errors.Is(err, immuta.ErrStorageClosed) {
 		t.Fatalf("expected ErrStorageClosed, got %v", err)
 	}
@@ -557,7 +559,7 @@ func TestVerifyAfterClose(t *testing.T) {
 
 	storage.Close()
 
-	err := storage.Verify("default")
+	err := storage.Verify(t.Context(), "default")
 	if !errors.Is(err, immuta.ErrStorageClosed) {
 		t.Fatalf("expected ErrStorageClosed, got %v", err)
 	}

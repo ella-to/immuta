@@ -205,21 +205,23 @@ func TestDetails(t *testing.T) {
 
 	n := 10
 
+	ctx := t.Context()
+
 	for range n {
-		_, _, err := storage.Append(context.Background(), "default", bytes.NewReader(content))
+		_, _, err := storage.Append(ctx, "default", bytes.NewReader(content))
 		if err != nil {
 			t.Errorf("failed to append content: %v", err)
 		}
 	}
 
-	details, err := storage.Details("default")
+	details, err := storage.Details(t.Context(), "default")
 	if err != nil {
 		t.Fatalf("failed to get details: %v", err)
 	}
 
 	fmt.Println("details:", details)
 
-	if err := storage.Verify("default"); err != nil {
+	if err := storage.Verify(t.Context(), "default"); err != nil {
 		t.Fatalf("failed to verify storage: %v", err)
 	}
 }
@@ -754,5 +756,346 @@ func TestStreamWithCancelledContextBeforeClose(t *testing.T) {
 
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected context.DeadlineExceeded, got: %v", err)
+	}
+}
+
+// TestManyStreamsLimitedFDs tests that we can create many more streams than available file descriptors.
+// This demonstrates that streams only hold FDs while actively reading, not while waiting.
+func TestManyStreamsLimitedFDs(t *testing.T) {
+	t.Parallel()
+
+	// Create storage with only 2 reader FDs
+	os.RemoveAll("./TestManyStreamsLimitedFDs")
+	defer os.RemoveAll("./TestManyStreamsLimitedFDs")
+
+	storage, err := immuta.New(
+		immuta.WithFastWrite(true),
+		immuta.WithLogsDirPath("./TestManyStreamsLimitedFDs"),
+		immuta.WithNamespaces("default"),
+		immuta.WithReaderCount(2), // Only 2 FDs available
+	)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	defer storage.Close()
+
+	// Write some initial messages
+	messagesCount := 10
+	for i := 0; i < messagesCount; i++ {
+		_, _, err := storage.Append(context.Background(), "default", strings.NewReader(fmt.Sprintf("message %d", i)))
+		if err != nil {
+			t.Fatalf("failed to append message %d: %v", i, err)
+		}
+	}
+
+	// Create 20 concurrent streams (10x more than FD count)
+	streamsCount := 20
+	var wg sync.WaitGroup
+	wg.Add(streamsCount)
+
+	errCh := make(chan error, streamsCount)
+
+	for streamIdx := range streamsCount {
+		go func(idx int) {
+			defer wg.Done()
+
+			stream := storage.Stream(context.Background(), "default", 0)
+			defer stream.Done()
+
+			// Each stream reads all messages
+			for msgIdx := 0; msgIdx < messagesCount; msgIdx++ {
+				r, _, err := stream.Next(context.Background())
+				if err != nil {
+					errCh <- fmt.Errorf("stream %d failed to read message %d: %w", idx, msgIdx, err)
+					return
+				}
+
+				// Actually read the data
+				buf := new(bytes.Buffer)
+				if _, err := buf.ReadFrom(r); err != nil {
+					r.Done()
+					errCh <- fmt.Errorf("stream %d failed to read content %d: %w", idx, msgIdx, err)
+					return
+				}
+				r.Done()
+
+				expected := fmt.Sprintf("message %d", msgIdx)
+				if buf.String() != expected {
+					errCh <- fmt.Errorf("stream %d message %d: expected %q, got %q", idx, msgIdx, expected, buf.String())
+					return
+				}
+			}
+		}(streamIdx)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	// Check for errors
+	for err := range errCh {
+		t.Error(err)
+	}
+}
+
+// TestStreamsWaitingForDataShareFDs tests that multiple streams can read concurrently
+// with limited FD pool. Streams naturally serialize when competing for FDs.
+func TestStreamsWaitingForDataShareFDs(t *testing.T) {
+	t.Parallel()
+
+	os.RemoveAll("./TestStreamsWaitingForDataShareFDs")
+	defer os.RemoveAll("./TestStreamsWaitingForDataShareFDs")
+
+	storage, err := immuta.New(
+		immuta.WithFastWrite(true),
+		immuta.WithLogsDirPath("./TestStreamsWaitingForDataShareFDs"),
+		immuta.WithNamespaces("default"),
+		immuta.WithReaderCount(3), // Only 3 FDs
+	)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	defer storage.Close()
+
+	// Write initial messages
+	messagesCount := 10
+	for i := 0; i < messagesCount; i++ {
+		_, _, err := storage.Append(context.Background(), "default", strings.NewReader(fmt.Sprintf("data %d", i)))
+		if err != nil {
+			t.Fatalf("failed to append message %d: %v", i, err)
+		}
+	}
+
+	// Create 10 concurrent streams (more than available FDs)
+	// With limited FDs, reads will naturally serialize
+	streamsCount := 10
+	var wg sync.WaitGroup
+	wg.Add(streamsCount)
+
+	errCh := make(chan error, streamsCount)
+
+	// Start concurrent readers - no artificial timeout, let them compete for FDs naturally
+	for streamIdx := 0; streamIdx < streamsCount; streamIdx++ {
+		go func(idx int) {
+			defer wg.Done()
+
+			stream := storage.Stream(context.Background(), "default", 0)
+			defer stream.Done()
+
+			for msgIdx := 0; msgIdx < messagesCount; msgIdx++ {
+				// Use background context - let FD acquisition block naturally
+				r, _, err := stream.Next(context.Background())
+				if err != nil {
+					errCh <- fmt.Errorf("stream %d failed at message %d: %w", idx, msgIdx, err)
+					return
+				}
+
+				buf := new(bytes.Buffer)
+				if _, err := buf.ReadFrom(r); err != nil {
+					r.Done()
+					errCh <- fmt.Errorf("stream %d failed to read content %d: %w", idx, msgIdx, err)
+					return
+				}
+				r.Done()
+
+				expected := fmt.Sprintf("data %d", msgIdx)
+				if buf.String() != expected {
+					errCh <- fmt.Errorf("stream %d message %d: expected %q, got %q", idx, msgIdx, expected, buf.String())
+					return
+				}
+			}
+		}(streamIdx)
+	}
+
+	// Wait with timeout for the whole test
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success
+	case <-time.After(30 * time.Second):
+		t.Fatal("test timed out - possible deadlock")
+	}
+
+	close(errCh)
+
+	// Check for errors
+	for err := range errCh {
+		t.Error(err)
+	}
+}
+
+// TestFDReleaseOnStreamDone verifies that FDs are not leaked when streams are done
+func TestFDReleaseOnStreamDone(t *testing.T) {
+	t.Parallel()
+
+	os.RemoveAll("./TestFDReleaseOnStreamDone")
+	defer os.RemoveAll("./TestFDReleaseOnStreamDone")
+
+	storage, err := immuta.New(
+		immuta.WithFastWrite(true),
+		immuta.WithLogsDirPath("./TestFDReleaseOnStreamDone"),
+		immuta.WithNamespaces("default"),
+		immuta.WithReaderCount(2),
+	)
+	if err != nil {
+		t.Fatalf("failed to create storage: %v", err)
+	}
+	defer storage.Close()
+
+	// Write a message
+	_, _, err = storage.Append(context.Background(), "default", strings.NewReader("test"))
+	if err != nil {
+		t.Fatalf("failed to append: %v", err)
+	}
+
+	// Create and immediately close many streams
+	for i := 0; i < 100; i++ {
+		stream := storage.Stream(context.Background(), "default", 0)
+		r, _, err := stream.Next(context.Background())
+		if err != nil {
+			t.Fatalf("iteration %d: failed to read: %v", i, err)
+		}
+		io.Copy(io.Discard, r)
+		r.Done()
+		stream.Done()
+	}
+
+	// If FDs were leaked, this would fail or deadlock
+	stream := storage.Stream(context.Background(), "default", 0)
+	defer stream.Done()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	r, _, err := stream.Next(ctx)
+	if err != nil {
+		t.Fatalf("failed to read after many stream cycles: %v", err)
+	}
+	defer r.Done()
+
+	buf := new(bytes.Buffer)
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("failed to read content: %v", err)
+	}
+
+	if buf.String() != "test" {
+		t.Fatalf("expected 'test', got %q", buf.String())
+	}
+}
+
+// BenchmarkManyStreamsLimitedFDs benchmarks concurrent stream reads with limited FDs.
+// This demonstrates the efficiency of FD sharing across many streams.
+func BenchmarkManyStreamsLimitedFDs(b *testing.B) {
+	os.RemoveAll("./BenchmarkManyStreamsLimitedFDs")
+	defer os.RemoveAll("./BenchmarkManyStreamsLimitedFDs")
+
+	storage, err := immuta.New(
+		immuta.WithFastWrite(true),
+		immuta.WithLogsDirPath("./BenchmarkManyStreamsLimitedFDs"),
+		immuta.WithNamespaces("default"),
+		immuta.WithReaderCount(5), // Limited FDs
+	)
+	if err != nil {
+		b.Fatalf("failed to create storage: %v", err)
+	}
+	defer storage.Close()
+
+	// Pre-populate with messages
+	messagesCount := 100
+	content := []byte(strings.Repeat("x", 1024)) // 1KB messages
+	for i := 0; i < messagesCount; i++ {
+		_, _, err := storage.Append(context.Background(), "default", bytes.NewReader(content))
+		if err != nil {
+			b.Fatalf("failed to append: %v", err)
+		}
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		// Create 20 concurrent streams (4x FD count)
+		streamsCount := 20
+		var wg sync.WaitGroup
+		wg.Add(streamsCount)
+
+		for j := 0; j < streamsCount; j++ {
+			go func() {
+				defer wg.Done()
+
+				stream := storage.Stream(context.Background(), "default", 0)
+				defer stream.Done()
+
+				for k := 0; k < messagesCount; k++ {
+					r, _, err := stream.Next(context.Background())
+					if err != nil {
+						b.Errorf("failed to read: %v", err)
+						return
+					}
+					io.Copy(io.Discard, r)
+					r.Done()
+				}
+			}()
+		}
+
+		wg.Wait()
+	}
+}
+
+// BenchmarkFDContention benchmarks worst-case FD contention scenario
+func BenchmarkFDContention(b *testing.B) {
+	os.RemoveAll("./BenchmarkFDContention")
+	defer os.RemoveAll("./BenchmarkFDContention")
+
+	storage, err := immuta.New(
+		immuta.WithFastWrite(true),
+		immuta.WithLogsDirPath("./BenchmarkFDContention"),
+		immuta.WithNamespaces("default"),
+		immuta.WithReaderCount(2), // Very limited FDs
+	)
+	if err != nil {
+		b.Fatalf("failed to create storage: %v", err)
+	}
+	defer storage.Close()
+
+	// Pre-populate
+	for i := 0; i < 10; i++ {
+		_, _, err := storage.Append(context.Background(), "default", strings.NewReader(fmt.Sprintf("msg %d", i)))
+		if err != nil {
+			b.Fatalf("failed to append: %v", err)
+		}
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		// 50 concurrent streams competing for 2 FDs
+		streamsCount := 50
+		var wg sync.WaitGroup
+		wg.Add(streamsCount)
+
+		for j := 0; j < streamsCount; j++ {
+			go func() {
+				defer wg.Done()
+
+				stream := storage.Stream(context.Background(), "default", 0)
+				defer stream.Done()
+
+				for k := 0; k < 10; k++ {
+					r, _, err := stream.Next(context.Background())
+					if err != nil {
+						b.Errorf("failed to read: %v", err)
+						return
+					}
+					io.Copy(io.Discard, r)
+					r.Done()
+				}
+			}()
+		}
+
+		wg.Wait()
 	}
 }
