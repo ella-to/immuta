@@ -73,6 +73,11 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	// commit the append
+	log.Save(namespace, &err)
+	if err != nil {
+		panic(err)
+	}
 
 	fmt.Printf("Original size: %d bytes\n", len(content))
 	fmt.Printf("Compressed size: %d bytes (saved %d bytes)\n", size, len(content)-int(size))

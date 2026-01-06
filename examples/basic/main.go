@@ -39,6 +39,11 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	// commit the append
+	log.Save(namespace, &err)
+	if err != nil {
+		panic(err)
+	}
 
 	if index != 8 {
 		panic("index must be 8")

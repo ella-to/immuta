@@ -101,6 +101,32 @@ func main() {
 }
 ```
 
+### Transactional Appends (Save) 🔒
+
+Immuta provides a transactional pattern for appends using the `Save` method. Each append is staged until committed — callers should defer a call to `Save` with a pointer to the returning `err` so the storage can either commit (on success) or roll back (on error).
+
+Example:
+
+```go
+func write(ctx context.Context, log *immuta.Storage) (err error) {
+    // Defer the Save call immediately so it can commit or rollback based on the named return error.
+    defer log.Save("events", &err)
+
+    // Perform the append; Save will commit when this function returns with err == nil
+    _, _, err = log.Append(ctx, "events", bytes.NewReader([]byte("some data")))
+    if err != nil {
+        return err
+    }
+    return nil
+}
+```
+
+Notes:
+
+- Call `defer log.Save(namespace, &err)` immediately after you start the operation that performs appends.
+- On error, `Save` will truncate the log file back to the previous state.
+- On success, `Save` updates the log header and notifies readers of the new messages.
+
 ## Configuration Options
 
 | Option | Description | Default |
@@ -337,20 +363,24 @@ func main() {
 
 Benchmarks on Apple M2 Pro:
 
+```bash
+go test -bench=. -benchmem
+```
+
 ### Write Performance
 
 | Message Size | Throughput | Allocations |
 |--------------|------------|-------------|
-| 100 bytes | ~17 MB/s | 2 allocs/op |
-| 1 KB | ~160 MB/s | 2 allocs/op |
-| 4 KB | ~450 MB/s | 2 allocs/op |
-| 64 KB | ~4 GB/s | 2 allocs/op |
+| 100 bytes | 18.30 MB/s | 2 allocs/op |
+| 1 KB | 162.09 MB/s | 2 allocs/op |
+| 4 KB | 421.89 MB/s | 2 allocs/op |
+| 64 KB | 922.17 MB/s | 2 allocs/op |
 
 ### Read Performance
 
 | Message Size | Throughput | Allocations |
 |--------------|------------|-------------|
-| 1 KB | ~686 MB/s | 6 allocs/op |
+| 1 KB | 800.07 MB/s | 5 allocs/op |
 
 ### Bulk Operations
 

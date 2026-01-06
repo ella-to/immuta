@@ -27,6 +27,7 @@ var (
 	ErrNamespaceRequired = errors.New("namespace is required")
 	ErrNamesapceNotFound = errors.New("namespace not found")
 	ErrStorageClosed     = errors.New("storage is closed")
+	ErrReaderCountIsZero = errors.New("reader count must be greater than zero")
 )
 
 // Transformer transforms a reader into another reader.
@@ -39,6 +40,9 @@ type Appender interface {
 	// Append writes the content of the reader to the storage medium.
 	// and returns the index and size of the content written.
 	Append(ctx context.Context, r io.Reader) (index int64, size int64, err error)
+	// Save implements the transactional commit/rollback for the most recent Append.
+	// Should be deferred by the caller as: defer storage.Save(&err)
+	Save(err *error)
 }
 
 // Stream is an interface that deals with reading from the storage medium.
@@ -56,12 +60,18 @@ type Stream interface {
 //
 
 type storage struct {
-	w              *os.File
-	fds            chan *os.File
-	bc             solid.Broadcast
-	currSize       int64
-	currCount      int64
-	lastIndex      int64
+	w         *os.File
+	fds       chan *os.File
+	bc        solid.Broadcast
+	currSize  int64
+	currCount int64
+	lastIndex int64
+	// transaction pending info for deferred Save
+	txPending      bool
+	txIndex        int64
+	txSize         int64
+	txPendingCount int64 // number of pending appends not yet committed
+	txBaseSize     int64 // file size before first pending append
 	streamIdcount  atomic.Int64
 	closed         atomic.Bool
 	writeTransform Transformer // transforms data before writing
@@ -70,32 +80,21 @@ type storage struct {
 
 var _ Appender = (*storage)(nil)
 
-func (s *storage) getFd(ctx context.Context) (*os.File, error) {
+func (s *storage) getFd(ctx context.Context) *os.File {
 	select {
-	case fd, ok := <-s.fds:
-		if !ok {
-			return nil, ErrStorageClosed
-		}
-		return fd, nil
+	case fd := <-s.fds:
+		return fd
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil
 	}
 }
 
-func (s *storage) putFd(ctx context.Context, fd *os.File) error {
+func (s *storage) putFd(fd *os.File) {
 	if s.closed.Load() {
-		// Storage is closed, don't try to put fd back
-		return nil
+		fd.Close()
+		return
 	}
-	select {
-	case s.fds <- fd:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-		// Channel is full or closed, this shouldn't happen in normal operation
-		return nil
-	}
+	s.fds <- fd
 }
 
 func loadFileHeader(fd *os.File) (total int64, index int64, err error) {
@@ -122,11 +121,8 @@ func (s *storage) Details(ctx context.Context) (string, error) {
 		return "", ErrStorageClosed
 	}
 
-	fd, err := s.getFd(ctx)
-	if err != nil {
-		return "", err
-	}
-	defer s.putFd(ctx, fd)
+	fd := s.getFd(ctx)
+	defer s.putFd(fd)
 
 	stat, err := fd.Stat()
 	if err != nil {
@@ -141,11 +137,8 @@ func (s *storage) Verify(ctx context.Context) error {
 		return ErrStorageClosed
 	}
 
-	fd, err := s.getFd(ctx)
-	if err != nil {
-		return err
-	}
-	defer s.putFd(ctx, fd)
+	fd := s.getFd(ctx)
+	defer s.putFd(fd)
 
 	stat, err := fd.Stat()
 	if err != nil {
@@ -195,46 +188,10 @@ func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 		return -1, -1, ErrStorageClosed
 	}
 
-	defer func() {
-		// if there is an error, move the current position back to the original position
-		if err != nil {
-			// truncate the file to the original size
-			truncErr := s.w.Truncate(s.currSize)
-			if truncErr != nil {
-				err = errors.Join(err, fmt.Errorf("failed to truncate the file: %w", truncErr))
-			}
-			return
-		}
-
-		_, err = s.w.Seek(0, io.SeekStart)
-		if err != nil {
-			err = fmt.Errorf("failed to seek to the beginning of the file: %w", err)
-			return
-		}
-
-		currCount := s.currCount + 1
-
-		// write the total number of messages and the index of the last message
-		// into a single 16 bytes and write it to the beginning of the file
-		// to make sure that the file is consistent and if the file is corrupted
-		// revert back to the original state.
-		var header [16]byte
-		binary.LittleEndian.PutUint64(header[:8], uint64(currCount))
-		binary.LittleEndian.PutUint64(header[8:], uint64(index))
-
-		_, err = s.w.Write(header[:])
-		if err != nil {
-			err = fmt.Errorf("failed to write the header: %w", err)
-			return
-		}
-
-		// only update the current size and the last index if there is no error
-		s.currSize += size + RecordHeaderSize
-		s.lastIndex = index
-		s.currCount = currCount
-
-		s.bc.Notify()
-	}()
+	// If this is the first append in a pending transaction, record the base size
+	if !s.txPending {
+		s.txBaseSize = s.currSize
+	}
 
 	index = s.currSize
 
@@ -243,7 +200,7 @@ func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 		return -1, -1, err
 	}
 
-	// write header first
+	// write header first (placeholder)
 	_, err = s.w.Write(emptyRecordHeader)
 	if err != nil {
 		return -1, -1, err
@@ -261,6 +218,7 @@ func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 	// copy the content
 	size, err = io.Copy(s.w, contentReader)
 	if err != nil {
+		// leave file as-is; caller's deferred Save is expected to rollback
 		return -1, -1, err
 	}
 
@@ -277,6 +235,15 @@ func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 	if err != nil {
 		return -1, -1, err
 	}
+
+	// set pending transaction info; caller should call Save(&err) (deferred) to commit/rollback
+	s.txPending = true
+	s.txIndex = index
+	s.txSize = size
+	s.txPendingCount++
+
+	// advance in-memory current size so subsequent appends append after this
+	s.currSize = currSize
 
 	return index, size, nil
 }
@@ -299,6 +266,60 @@ func (s *storage) Close() error {
 	}
 
 	return s.w.Close()
+}
+
+// Save performs a transactional commit or rollback for the last Append.
+// It is intended to be deferred by callers as: defer st.Save(&err)
+func (s *storage) Save(err *error) {
+	// If there is no pending tx, nothing to do
+	if !s.txPending {
+		return
+	}
+	// Ensure transactional flags are cleared when done
+	defer func() {
+		s.txPending = false
+		s.txPendingCount = 0
+	}()
+
+	// If caller signaled an error, rollback by truncating the file to the base size
+	if err != nil && *err != nil {
+		truncErr := s.w.Truncate(s.txBaseSize)
+		if truncErr != nil {
+			*err = errors.Join(*err, fmt.Errorf("failed to truncate the file: %w", truncErr))
+		}
+		// restore in-memory state
+		s.currSize = s.txBaseSize
+		return
+	}
+
+	// Commit: update the file header and in-memory counters
+	_, seekErr := s.w.Seek(0, io.SeekStart)
+	if seekErr != nil {
+		if err != nil {
+			*err = fmt.Errorf("failed to seek to the beginning of the file: %w", seekErr)
+		}
+		return
+	}
+
+	currCount := s.currCount + s.txPendingCount
+	var header [16]byte
+	binary.LittleEndian.PutUint64(header[:8], uint64(currCount))
+	binary.LittleEndian.PutUint64(header[8:], uint64(s.txIndex))
+
+	_, writeErr := s.w.Write(header[:])
+	if writeErr != nil {
+		if err != nil {
+			*err = fmt.Errorf("failed to write the header: %w", writeErr)
+		}
+		return
+	}
+
+	// update counters (currSize already reflects appended data)
+	s.lastIndex = s.txIndex
+	s.currCount = currCount
+
+	// notify waiting readers of the number of new messages
+	s.bc.Notify(s.txPendingCount)
 }
 
 // Stream(ctx, 0) 	-> from the beginning
@@ -366,6 +387,19 @@ func (s *Storage) Append(ctx context.Context, namespace string, r io.Reader) (in
 	return st.Append(ctx, r)
 }
 
+// Save performs a transactional commit/rollback for the most recent Append
+// on the specified namespace. Intended to be used as: defer s.Save(namespace, &err)
+func (s *Storage) Save(namespace string, err *error) {
+	st, gerr := s.getStorageByNamespace(namespace)
+	if gerr != nil {
+		if err != nil && *err == nil {
+			*err = gerr
+		}
+		return
+	}
+	st.Save(err)
+}
+
 func (s *Storage) Stream(ctx context.Context, namespace string, startPos int64) Stream {
 	st, err := s.getStorageByNamespace(namespace)
 	if err != nil {
@@ -414,7 +448,7 @@ func WithLogsDirPath(path string) OptionFunc {
 func WithReaderCount(count int) OptionFunc {
 	return func(o *options) error {
 		if count <= 0 {
-			return fmt.Errorf("readerCount must be greater than 0")
+			return ErrReaderCountIsZero
 		}
 
 		o.readerCount = count
@@ -487,7 +521,11 @@ func New(optFns ...OptionFunc) (*Storage, error) {
 	}
 
 	if len(o.namespaces) == 0 {
-		return nil, fmt.Errorf("no namespaces provided")
+		return nil, ErrNamespaceRequired
+	}
+
+	if o.readerCount <= 0 {
+		return nil, ErrReaderCountIsZero
 	}
 
 	err := os.MkdirAll(o.logsDirPath, 0o755)
@@ -516,7 +554,7 @@ func New(optFns ...OptionFunc) (*Storage, error) {
 
 func newStorage(filepath string, readerCount int, fastWrite bool, writeTransform, readTransform Transformer) (*storage, error) {
 	if readerCount <= 0 {
-		return nil, fmt.Errorf("readerCount must be greater than 0")
+		return nil, ErrReaderCountIsZero
 	}
 
 	var flag int
@@ -592,15 +630,9 @@ func newStorage(filepath string, readerCount int, fastWrite bool, writeTransform
 		readTransform:  readTransform,
 	}
 
-	for i := 0; i < readerCount; i++ {
+	for range readerCount {
 		fd, err := os.Open(filepath)
 		if err != nil {
-			// Close already opened fds
-			close(st.fds)
-			for fd := range st.fds {
-				fd.Close()
-			}
-			w.Close()
 			return nil, err
 		}
 		st.fds <- fd
@@ -625,8 +657,8 @@ type stream struct {
 	id            int64
 	index         int64
 	startPos      int64
-	getFd         func(context.Context) (*os.File, error)
-	putFd         func(context.Context, *os.File) error
+	getFd         func(ctx context.Context) *os.File
+	putFd         func(*os.File)
 	getLast       func() int64
 	isClosed      func() bool
 	signal        solid.Signal
@@ -704,16 +736,16 @@ func (s *stream) Next(ctx context.Context) (r *Reader, size int64, err error) {
 		}
 
 		// NOW acquire FD only when we need to read
-		fd, err := s.getFd(ctx)
-		if err != nil {
-			return nil, -1, err
+		fd := s.getFd(ctx)
+		if fd == nil {
+			return nil, -1, ctx.Err()
 		}
 
 		// Initialize index on first read
 		if s.index == -1 {
 			s.index, err = s.findIndex(fd)
 			if err != nil {
-				_ = s.putFd(context.WithoutCancel(ctx), fd)
+				s.putFd(fd)
 				return nil, -1, err
 			}
 		}
@@ -721,7 +753,7 @@ func (s *stream) Next(ctx context.Context) (r *Reader, size int64, err error) {
 		// Seek to current position
 		_, err = fd.Seek(s.index, io.SeekStart)
 		if err != nil {
-			_ = s.putFd(context.WithoutCancel(ctx), fd)
+			s.putFd(fd)
 			return nil, -1, fmt.Errorf("failed to seek to index %d, id: %d: %w", s.index, s.id, err)
 		}
 
@@ -729,10 +761,10 @@ func (s *stream) Next(ctx context.Context) (r *Reader, size int64, err error) {
 		err = binary.Read(fd, binary.LittleEndian, &size)
 		if errors.Is(err, io.EOF) {
 			// No data available yet, release FD and wait for next signal
-			_ = s.putFd(context.WithoutCancel(ctx), fd)
+			s.putFd(fd)
 			continue
 		} else if err != nil {
-			_ = s.putFd(context.WithoutCancel(ctx), fd)
+			s.putFd(fd)
 			return nil, -1, fmt.Errorf("failed to read size of content at %d, id: %d: %w", s.index, s.id, err)
 		}
 
@@ -740,9 +772,9 @@ func (s *stream) Next(ctx context.Context) (r *Reader, size int64, err error) {
 		return &Reader{
 			r:             io.LimitReader(fd, size),
 			readTransform: s.readTransform,
-			done: func() error {
+			done: func() {
 				s.index += size + RecordHeaderSize
-				return s.putFd(ctx, fd)
+				s.putFd(fd)
 			},
 		}, size, nil
 	}
@@ -760,7 +792,7 @@ type Reader struct {
 	r             io.Reader
 	readTransform Transformer
 	transformed   io.Reader
-	done          func() error
+	done          func()
 	transformErr  error
 }
 
@@ -785,6 +817,6 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 	return r.r.Read(p)
 }
 
-func (r *Reader) Done() error {
-	return r.done()
+func (r *Reader) Done() {
+	r.done()
 }
