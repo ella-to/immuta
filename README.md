@@ -38,7 +38,7 @@
 ## Installation
 
 ```bash
-go get ella.to/immuta@v0.2.2
+go get ella.to/immuta@v0.2.3
 ```
 
 ## Quick Start
