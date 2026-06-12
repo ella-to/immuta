@@ -38,7 +38,7 @@
 ## Installation
 
 ```bash
-go get ella.to/immuta@v0.2.3
+go get ella.to/immuta@v0.2.4
 ```
 
 ## Quick Start
@@ -133,7 +133,8 @@ Notes:
 |--------|-------------|---------|
 | `WithLogsDirPath(path)` | Directory for log files | `"./logs"` |
 | `WithReaderCount(n)` | Number of pooled file descriptors for concurrent reads | `5` |
-| `WithFastWrite(bool)` | Use buffered writes (faster) or sync writes (more durable) | `true` |
+| `WithFastWrite(bool)` | Use buffered writes (faster) or `O_SYNC` writes (more durable) | `true` |
+| `WithSyncOnSave(bool)` | Fsync once per `Save` (group commit): batch many appends, pay the flush cost once per commit. The recommended durability mode on SSDs, combined with `WithFastWrite(true)` | `false` |
 | `WithNamespaces(names...)` | Create one or more namespaces | Required |
 | `WithWriteTransform(t)` | Transform data before writing | `nil` |
 | `WithReadTransform(t)` | Transform data after reading | `nil` |
