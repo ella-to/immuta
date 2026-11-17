@@ -26,6 +26,10 @@ const (
 	// per record.
 	readAheadSize = 64 * 1024
 
+	// smallWindowSize is the window a stream keeps for itself; it serves
+	// reads at the tail, where little data is available per wake-up.
+	smallWindowSize = 4 * 1024
+
 	// maxRetainedScratch caps the per-stream buffer NextBytes keeps for
 	// records that do not fit the read-ahead window.
 	maxRetainedScratch = 1 << 20
@@ -1173,6 +1177,7 @@ type stream struct {
 	// back to the pool whenever the stream has to wait for new data, so idle
 	// streams hold no buffer.
 	bufp    *[]byte
+	small   []byte // smallWindowSize window kept while idle at the tail
 	buf     []byte
 	bufOff  int64
 	lastBig bool   // the previous record did not fit the window
@@ -1264,10 +1269,24 @@ func (s *stream) window(off, n, end, fill int64) ([]byte, error) {
 	if n > readAheadSize {
 		return nil, nil
 	}
-	if s.bufp == nil {
+	size := min(max(fill, n), end-off)
+	var backing []byte
+	switch {
+	case s.bufp != nil:
+		backing = *s.bufp
+	case size <= smallWindowSize:
+		// at the tail only a few records are available: use the stream's
+		// own small window instead of cycling a pooled 64 KB buffer for
+		// every record
+		if s.small == nil {
+			s.small = make([]byte, smallWindowSize)
+		}
+		backing = s.small
+	default:
 		s.bufp = readAheadPool.Get().(*[]byte)
+		backing = *s.bufp
 	}
-	b := (*s.bufp)[:min(max(fill, n), end-off)]
+	b := backing[:size]
 	m, err := s.st.r.ReadAt(b, off)
 	if m < len(b) {
 		s.buf = nil

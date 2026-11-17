@@ -275,3 +275,28 @@ func TestStreamMixedSizesAcrossReadAhead(t *testing.T) {
 		t.Fatal("stream should not be ready at the end of the log")
 	}
 }
+
+// A stream waiting at the tail reads each new record as it is committed,
+// switching between the small tail window and the pooled read-ahead window.
+func TestStreamTailMixedSizes(t *testing.T) {
+	t.Parallel()
+
+	namespace := "tailmixed"
+	storage, cleanup := createStorage(t, "./TestStreamTailMixedSizes", namespace)
+	defer cleanup()
+
+	stream := storage.Stream(t.Context(), namespace, -1)
+	defer stream.Done()
+
+	for i, n := range []int{10, 4 * 1024, 4*1024 - 8, 5000, 3, 70 * 1024, 1, 64 * 1024, 0, 2} {
+		rec := bytes.Repeat([]byte{byte('a' + i)}, n)
+		appendAndSave(t, storage, namespace, rec)
+		got, _, err := stream.NextBytes(t.Context())
+		if err != nil {
+			t.Fatalf("record %d: %v", i, err)
+		}
+		if !bytes.Equal(got, rec) {
+			t.Fatalf("record %d mismatch (len %d vs %d)", i, len(got), n)
+		}
+	}
+}
