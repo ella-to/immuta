@@ -580,7 +580,7 @@ func (s *storage) Save(err *error) {
 	// Make the appended data durable before the header publishes it, so a
 	// crash cannot leave the header pointing at unwritten records.
 	if s.syncOnSave {
-		if syncErr := s.w.Sync(); syncErr != nil {
+		if syncErr := syncData(s.w); syncErr != nil {
 			s.abortCommit(err, fmt.Errorf("failed to sync appended data: %w", syncErr))
 			return
 		}
@@ -599,7 +599,7 @@ func (s *storage) Save(err *error) {
 	}
 
 	if s.syncOnSave {
-		if syncErr := s.w.Sync(); syncErr != nil {
+		if syncErr := syncData(s.w); syncErr != nil {
 			s.abortCommit(err, fmt.Errorf("failed to sync the header: %w", syncErr))
 			return
 		}
