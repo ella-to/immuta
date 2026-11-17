@@ -79,10 +79,12 @@ type Stream interface {
 //
 
 type storage struct {
-	w      *os.File
-	fds    chan *os.File
-	allFds []*os.File
-	bc     solid.Broadcast
+	w *os.File
+	// r is shared by every stream and reader. All reads are positional
+	// (pread), which is safe for concurrent use and never moves a shared
+	// file offset, so no pool of descriptors is needed.
+	r  *os.File
+	bc solid.Broadcast
 	// wbuf stages small records (header + payload) so they are written with a
 	// single syscall. Append is single-writer, so no locking is needed.
 	wbuf      []byte
@@ -102,23 +104,6 @@ type storage struct {
 }
 
 var _ Appender = (*storage)(nil)
-
-func (s *storage) getFd(ctx context.Context) (*os.File, error) {
-	select {
-	case fd := <-s.fds:
-		return fd, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
-// putFd returns a reader fd to the pool. The channel has capacity for every
-// reader fd and is never closed, so this never blocks and never panics even
-// when racing with Close. Close closes the underlying files directly; an fd
-// returned after that simply yields ErrClosed on the next read.
-func (s *storage) putFd(fd *os.File) {
-	s.fds <- fd
-}
 
 func loadFileHeader(fd *os.File) (total int64, index int64, err error) {
 	var hdr [FileHeaderSize]byte
@@ -168,13 +153,7 @@ func (s *storage) Details(ctx context.Context) (string, error) {
 		return "", ErrStorageClosed
 	}
 
-	fd, err := s.getFd(ctx)
-	if err != nil {
-		return "", err
-	}
-	defer s.putFd(fd)
-
-	stat, err := fd.Stat()
+	stat, err := s.r.Stat()
 	if err != nil {
 		return "", err
 	}
@@ -187,12 +166,7 @@ func (s *storage) Verify(ctx context.Context) error {
 		return ErrStorageClosed
 	}
 
-	fd, err := s.getFd(ctx)
-	if err != nil {
-		return err
-	}
-	defer s.putFd(fd)
-
+	fd := s.r
 	stat, err := fd.Stat()
 	if err != nil {
 		return err
@@ -383,13 +357,10 @@ func (s *storage) Close() error {
 	// Close the broadcast first to wake up all waiting streams
 	s.bc.Close()
 
-	// Close every reader fd directly. The fds channel itself is never closed,
-	// so a concurrent putFd cannot panic; in-flight readers observe ErrClosed.
+	// in-flight readers observe os.ErrClosed
 	var errs []error
-	for _, fd := range s.allFds {
-		if err := fd.Close(); err != nil {
-			errs = append(errs, err)
-		}
+	if err := s.r.Close(); err != nil {
+		errs = append(errs, err)
 	}
 
 	if err := s.w.Close(); err != nil {
@@ -604,6 +575,11 @@ func WithLogsDirPath(path string) OptionFunc {
 	}
 }
 
+// WithReaderCount is kept for compatibility and has no effect: every stream
+// shares one read-only descriptor and reads with pread, so the number of
+// concurrent readers is no longer bounded by a descriptor pool.
+//
+// Deprecated: the option is ignored.
 func WithReaderCount(count int) OptionFunc {
 	return func(o *options) error {
 		if count <= 0 {
@@ -788,8 +764,6 @@ func newStorage(filepath string, o *options) (*storage, error) {
 
 	st := &storage{
 		w:              w,
-		fds:            make(chan *os.File, o.readerCount),
-		allFds:         make([]*os.File, 0, o.readerCount),
 		bc:             solid.NewBroadcastCond(solid.WithInitialTotal(count)),
 		currSize:       size,
 		currCount:      count,
@@ -799,17 +773,10 @@ func newStorage(filepath string, o *options) (*storage, error) {
 		readTransform:  o.readTransform,
 	}
 
-	for range o.readerCount {
-		fd, err := os.Open(filepath)
-		if err != nil {
-			for _, opened := range st.allFds {
-				opened.Close()
-			}
-			w.Close()
-			return nil, err
-		}
-		st.allFds = append(st.allFds, fd)
-		st.fds <- fd
+	st.r, err = os.Open(filepath)
+	if err != nil {
+		w.Close()
+		return nil, err
 	}
 
 	return st, nil
@@ -908,17 +875,12 @@ func (s *stream) Next(ctx context.Context) (*Reader, int64, error) {
 			return nil, -1, ErrStorageClosed
 		}
 
-		// NOW acquire FD only when we need to read
-		fd, err := s.st.getFd(ctx)
-		if err != nil {
-			return nil, -1, err
-		}
+		fd := s.st.r
 
 		// Initialize index on first read
 		if s.index == -1 {
 			s.index, err = s.findIndex(fd)
 			if err != nil {
-				s.st.putFd(fd)
 				return nil, -1, err
 			}
 		}
@@ -928,16 +890,13 @@ func (s *stream) Next(ctx context.Context) (*Reader, int64, error) {
 		var hdr [RecordHeaderSize]byte
 		_, err = fd.ReadAt(hdr[:], s.index)
 		if errors.Is(err, io.EOF) {
-			// No data available yet, release FD and wait for next signal
-			s.st.putFd(fd)
+			// No data available yet, wait for the next signal
 			continue
 		} else if err != nil {
-			s.st.putFd(fd)
 			return nil, -1, fmt.Errorf("failed to read size of content at %d, id: %d: %w", s.index, s.id, err)
 		}
 		size := int64(binary.LittleEndian.Uint64(hdr[:]))
 
-		// Success - return Reader that will release FD when done
 		return &Reader{
 			fd:            fd,
 			off:           s.index + RecordHeaderSize,
@@ -1029,6 +988,5 @@ func (r *Reader) Done() {
 	}
 	r.finished = true
 	r.stream.index += r.size + RecordHeaderSize
-	r.stream.st.putFd(r.fd)
 	r.fd = nil
 }
