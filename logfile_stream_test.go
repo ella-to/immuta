@@ -169,3 +169,67 @@ func TestStreamLatestIsConstantTime(t *testing.T) {
 		t.Fatalf("first Next at the tail took %v, expected O(1)", elapsed)
 	}
 }
+
+func TestStreamAtOffsetAndCounters(t *testing.T) {
+	t.Parallel()
+
+	namespace := "offset"
+	storage, cleanup := createStorage(t, "./TestStreamAtOffsetAndCounters", namespace)
+	defer cleanup()
+
+	if got := storage.Namespaces(); len(got) != 1 || got[0] != namespace {
+		t.Fatalf("unexpected namespaces %v", got)
+	}
+
+	appendBatch(t, storage, namespace, "one", "two", "three")
+	if n, _ := storage.Count(namespace); n != 3 {
+		t.Fatalf("expected count 3, got %d", n)
+	}
+
+	// collect the offset of every record
+	stream := storage.Stream(t.Context(), namespace, 0)
+	var offsets []int64
+	for range 3 {
+		r, _, err := stream.Next(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		offsets = append(offsets, r.Offset())
+		r.Done()
+	}
+	stream.Done()
+
+	resumed := storage.StreamAt(t.Context(), namespace, offsets[1])
+	defer resumed.Done()
+	if got := readNext(t, resumed); string(got) != "two" {
+		t.Fatalf("expected %q, got %q", "two", got)
+	}
+
+	end, _ := storage.End(namespace)
+	tail := storage.StreamAt(t.Context(), namespace, end)
+	defer tail.Done()
+	appendAndSave(t, storage, namespace, []byte("four"))
+	if got := readNext(t, tail); string(got) != "four" {
+		t.Fatalf("expected %q, got %q", "four", got)
+	}
+
+	for _, off := range []int64{0, end + 1000} {
+		_, _, err := storage.StreamAt(t.Context(), namespace, off).Next(t.Context())
+		if !errors.Is(err, immuta.ErrInvalidOffset) {
+			t.Fatalf("offset %d: expected ErrInvalidOffset, got %v", off, err)
+		}
+	}
+}
+
+func TestStreamUnknownNamespace(t *testing.T) {
+	t.Parallel()
+
+	storage, cleanup := createStorage(t, "./TestStreamUnknownNamespace", "known")
+	defer cleanup()
+
+	stream := storage.Stream(t.Context(), "unknown", 0)
+	defer stream.Done()
+	if _, _, err := stream.Next(t.Context()); !errors.Is(err, immuta.ErrNamesapceNotFound) {
+		t.Fatalf("expected ErrNamesapceNotFound, got %v", err)
+	}
+}

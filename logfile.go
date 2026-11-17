@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 )
@@ -45,6 +46,7 @@ var (
 	ErrStorageClosed     = errors.New("storage is closed")
 	ErrReaderCountIsZero = errors.New("reader count must be greater than zero")
 	ErrCorrupted         = errors.New("log file is corrupted")
+	ErrInvalidOffset     = errors.New("offset is outside the committed records")
 )
 
 // Transformer transforms a reader into another reader.
@@ -604,14 +606,72 @@ func (s *Storage) Save(namespace string, err *error) {
 	st.Save(err)
 }
 
+// Stream creates a stream over the namespace. For an unknown namespace the
+// returned stream reports the error from Next.
 func (s *Storage) Stream(ctx context.Context, namespace string, startPos int64) Stream {
 	st, err := s.getStorageByNamespace(namespace)
 	if err != nil {
-		panic(err)
+		return errStream{err}
 	}
 
 	return st.Stream(ctx, startPos)
 }
+
+// StreamAt creates a stream that starts with the record at byte offset off,
+// as reported by Reader.Offset, or at End for only new records. The offset
+// must be a record boundary: it is only checked to lie within the committed
+// data, so callers should verify the first record they read.
+func (s *Storage) StreamAt(ctx context.Context, namespace string, off int64) Stream {
+	st, err := s.getStorageByNamespace(namespace)
+	if err != nil {
+		return errStream{err}
+	}
+	if off < FileHeaderSize || off > st.committedEnd.Load() {
+		return errStream{fmt.Errorf("%w: %d", ErrInvalidOffset, off)}
+	}
+
+	return &stream{
+		id:     st.streamIdcount.Add(1),
+		index:  off,
+		st:     st,
+		doneCh: make(chan struct{}),
+	}
+}
+
+// Count returns the number of committed records in the namespace.
+func (s *Storage) Count(namespace string) (int64, error) {
+	st, err := s.getStorageByNamespace(namespace)
+	if err != nil {
+		return -1, err
+	}
+	return st.committedCnt.Load(), nil
+}
+
+// End returns the byte offset just past the last committed record in the
+// namespace. StreamAt(End) delivers only records committed afterwards.
+func (s *Storage) End(namespace string) (int64, error) {
+	st, err := s.getStorageByNamespace(namespace)
+	if err != nil {
+		return -1, err
+	}
+	return st.committedEnd.Load(), nil
+}
+
+// Namespaces returns the configured namespaces in sorted order.
+func (s *Storage) Namespaces() []string {
+	names := make([]string, 0, len(s.mapper))
+	for name := range s.mapper {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// errStream is returned for streams that could not be created.
+type errStream struct{ err error }
+
+func (e errStream) Next(context.Context) (*Reader, int64, error) { return nil, -1, e.err }
+func (e errStream) Done()                                        {}
 
 func (s *Storage) Details(ctx context.Context, namespace string) (string, error) {
 	st, err := s.getStorageByNamespace(namespace)
@@ -938,6 +998,7 @@ func (s *stream) Next(ctx context.Context) (*Reader, int64, error) {
 
 	return &Reader{
 		fd:            s.st.r,
+		recordOff:     s.index,
 		off:           s.index + RecordHeaderSize,
 		remaining:     size,
 		size:          size,
@@ -971,6 +1032,7 @@ func (s *stream) Done() {
 // file with positional reads (pread).
 type Reader struct {
 	fd            *os.File
+	recordOff     int64
 	off           int64
 	remaining     int64
 	size          int64
@@ -1029,6 +1091,12 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 	}
 
 	return r.transformed.Read(p)
+}
+
+// Offset returns the byte offset of this record in the log, usable as a
+// resume position with Storage.StreamAt.
+func (r *Reader) Offset() int64 {
+	return r.recordOff
 }
 
 func (r *Reader) Done() {
