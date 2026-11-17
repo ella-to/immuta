@@ -61,7 +61,6 @@ func main() {
 	// Create storage with a namespace
 	log, err := immuta.New(
 		immuta.WithLogsDirPath("./log-data"),
-		immuta.WithReaderCount(10),      // Pool of file descriptors for readers
 		immuta.WithFastWrite(true),      // Use buffered writes (faster but less durable)
 		immuta.WithNamespaces("events"), // Create a namespace called "events"
 	)
@@ -70,9 +69,10 @@ func main() {
 	}
 	defer log.Close()
 
-	// Write data
+	// Write data; records become visible to readers when Save commits them
 	content := []byte("hello world")
 	index, size, err := log.Append(context.Background(), "events", bytes.NewReader(content))
+	log.Save("events", &err)
 	if err != nil {
 		panic(err)
 	}
@@ -93,7 +93,7 @@ func main() {
 		}
 		panic(err)
 	}
-	defer r.Done() // Important: release the file descriptor
+	defer r.Done() // Important: advances the stream; the Reader is reused by the next Next
 
 	var buf bytes.Buffer
 	io.Copy(&buf, r)
@@ -125,19 +125,21 @@ Notes:
 
 - Call `defer log.Save(namespace, &err)` immediately after you start the operation that performs appends.
 - On error, `Save` will truncate the log file back to the previous state.
-- On success, `Save` updates the log header and notifies readers of the new messages.
+- On success, `Save` writes the buffered records with a single write, updates the log header and wakes readers waiting for new messages.
+- Records appended but not saved are never visible to readers. If the process stops before `Save`, they are discarded the next time the log is opened.
 
 ## Configuration Options
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `WithLogsDirPath(path)` | Directory for log files | `"./logs"` |
-| `WithReaderCount(n)` | Number of pooled file descriptors for concurrent reads | `5` |
+| `WithReaderCount(n)` | Deprecated, no effect: all streams share one descriptor and read with `pread` | |
 | `WithFastWrite(bool)` | Use buffered writes (faster) or `O_SYNC` writes (more durable) | `true` |
 | `WithSyncOnSave(bool)` | Fsync once per `Save` (group commit): batch many appends, pay the flush cost once per commit. The recommended durability mode on SSDs, combined with `WithFastWrite(true)` | `false` |
 | `WithNamespaces(names...)` | Create one or more namespaces | Required |
 | `WithWriteTransform(t)` | Transform data before writing | `nil` |
 | `WithReadTransform(t)` | Transform data after reading | `nil` |
+| `WithCodec(enc, dec)` | Whole-record byte-slice codecs (encryption, compression); faster than transformers and `Next` reports the decoded size. Cannot be combined with transformers | `nil` |
 
 ## Stream Positioning
 
@@ -153,6 +155,22 @@ stream := log.Stream(ctx, "events", -1)
 // Skip the first N messages
 stream := log.Stream(ctx, "events", 10) // Skip first 10 messages
 ```
+
+Starting at the beginning or at the end is O(1); skipping N records walks their headers.
+
+To resume from a known record in O(1), keep its byte offset and use `StreamAt`:
+
+```go
+data, off, err := stream.NextBytes(ctx) // data is valid until the next call
+// ... persist off ...
+resumed := log.StreamAt(ctx, "events", off) // starts with that record
+
+end, _ := log.End("events")
+tail := log.StreamAt(ctx, "events", end) // only records committed from now on
+count, _ := log.Count("events")          // number of committed records
+```
+
+`Reader.Offset()` returns the same offset when using `Next`. `Ready()` reports whether `Next` would return without waiting.
 
 ## Data Transformers
 
