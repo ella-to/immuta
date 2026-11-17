@@ -399,3 +399,25 @@ func TestReopenExistingLog(t *testing.T) {
 		t.Fatalf("verify failed: %v", err)
 	}
 }
+
+// shortLen reports fewer bytes than it holds.
+type shortLen struct{ *bytes.Reader }
+
+func (s shortLen) Len() int { return s.Reader.Len() - 2 }
+
+func TestAppendRejectsUnderReportedLen(t *testing.T) {
+	t.Parallel()
+
+	namespace := "shortlen"
+	storage, cleanup := createStorage(t, "./TestAppendRejectsUnderReportedLen", namespace)
+	defer cleanup()
+
+	_, _, err := storage.Append(t.Context(), namespace, shortLen{bytes.NewReader([]byte("hello"))})
+	storage.Save(namespace, &err)
+	if err == nil {
+		t.Fatal("expected an error for a reader whose Len() under-reports")
+	}
+	if n, _ := storage.Count(namespace); n != 0 {
+		t.Fatalf("expected nothing committed, got %d records", n)
+	}
+}

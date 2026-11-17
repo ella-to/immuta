@@ -258,6 +258,11 @@ func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 			// nothing has been written yet, the file is untouched
 			return -1, -1, fmt.Errorf("failed to read content: %w", err)
 		}
+		// Len() must be exact, otherwise the record would be silently cut
+		var probe [1]byte
+		if n, _ := contentReader.Read(probe[:]); n > 0 {
+			return -1, -1, fmt.Errorf("content is longer than its reported Len() of %d bytes", knownLen)
+		}
 		if _, err = s.w.Write(buf); err != nil {
 			s.discardPartialWrite(index)
 			return -1, -1, err
@@ -356,6 +361,8 @@ func (s *storage) discardPartialWrite(offset int64) {
 	_, _ = s.w.Seek(offset, io.SeekStart)
 }
 
+// Close must not run concurrently with Append or Save: the caller has to stop
+// its writer first. Pending appends that were not saved are rolled back.
 func (s *storage) Close() error {
 	// Check if already closed
 	if s.closed.Swap(true) {
