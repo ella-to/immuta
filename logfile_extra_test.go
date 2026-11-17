@@ -3,6 +3,7 @@ package immuta_test
 import (
 	"bytes"
 	"compress/flate"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -474,5 +475,57 @@ func TestBufferedAppendsOrderAndRollback(t *testing.T) {
 	}
 	if err := storage.Verify(t.Context(), namespace); err != nil {
 		t.Fatalf("verify failed: %v", err)
+	}
+}
+
+func TestCodecRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	// hex doubles the size, so the on-disk and decoded sizes differ
+	encode := func(dst, src []byte) ([]byte, error) { return hex.AppendEncode(dst, src), nil }
+	decode := func(dst, src []byte) ([]byte, error) { return hex.AppendDecode(dst, src) }
+
+	namespace := "codec"
+	storage, cleanup := createStorageOpts(t, "./TestCodecRoundTrip",
+		[]immuta.OptionFunc{immuta.WithCodec(encode, decode)}, namespace)
+	defer cleanup()
+
+	var records [][]byte
+	for i, n := range []int{0, 5, 40 * 1024, 100 * 1024, 7} {
+		rec := bytes.Repeat([]byte{byte('a' + i)}, n)
+		records = append(records, rec)
+		if i == 2 {
+			// unknown size source
+			_, _, err := storage.Append(t.Context(), namespace, hideLen{bytes.NewReader(rec)})
+			storage.Save(namespace, &err)
+			if err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		appendAndSave(t, storage, namespace, rec)
+	}
+
+	viaReader := storage.Stream(t.Context(), namespace, 0)
+	defer viaReader.Done()
+	viaBytes := storage.Stream(t.Context(), namespace, 0)
+	defer viaBytes.Done()
+	for i, want := range records {
+		if got := readNext(t, viaReader); !bytes.Equal(got, want) {
+			t.Fatalf("reader: record %d mismatch (len %d vs %d)", i, len(got), len(want))
+		}
+		got, _, err := viaBytes.NextBytes(t.Context())
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("bytes: record %d mismatch (len %d vs %d, err %v)", i, len(got), len(want), err)
+		}
+	}
+	if err := storage.Verify(t.Context(), namespace); err != nil {
+		t.Fatalf("verify failed: %v", err)
+	}
+
+	_, err := immuta.New(immuta.WithLogsDirPath(t.TempDir()), immuta.WithNamespaces("x"),
+		immuta.WithCodec(encode, decode), immuta.WithReadTransform(func(r io.Reader) (io.Reader, error) { return r, nil }))
+	if !errors.Is(err, immuta.ErrCodecWithTransform) {
+		t.Fatalf("expected ErrCodecWithTransform, got %v", err)
 	}
 }

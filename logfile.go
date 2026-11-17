@@ -77,6 +77,14 @@ var (
 // Multiple transformers can be chained together.
 type Transformer func(r io.Reader) (io.Reader, error)
 
+// Codec transforms a whole record at once. It appends the result of
+// transforming src to dst and returns the extended slice. Unlike a
+// Transformer, the encoded size is known before writing, so records are
+// written with a single syscall and Next reports the decoded size.
+type Codec func(dst, src []byte) ([]byte, error)
+
+var ErrCodecWithTransform = errors.New("a codec cannot be combined with a read or write transformer")
+
 // Appender is a single method interface that writes the content of the reader to the storage medium.
 type Appender interface {
 	// Append writes the content of the reader to the storage medium.
@@ -152,6 +160,9 @@ type storage struct {
 	syncOnSave     bool        // fsync data and header during Save (group commit)
 	writeTransform Transformer // transforms data before writing
 	readTransform  Transformer // transforms data after reading
+	encode         Codec       // encodes whole records before writing
+	decode         Codec       // decodes whole records after reading
+	plain          []byte      // scratch for the input of encode
 }
 
 var _ Appender = (*storage)(nil)
@@ -275,6 +286,10 @@ func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 
 	index = s.currSize
 
+	if s.encode != nil {
+		return s.appendEncoded(index, r)
+	}
+
 	var contentReader io.Reader = r
 	knownLen := -1
 	if s.writeTransform != nil {
@@ -369,6 +384,64 @@ func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 	s.currSize = index + size + RecordHeaderSize
 
 	return index, size, nil
+}
+
+// appendEncoded reads the whole content, encodes it and buffers the record.
+func (s *storage) appendEncoded(index int64, r io.Reader) (int64, int64, error) {
+	plain, err := s.readInput(r)
+	if err != nil {
+		return -1, -1, fmt.Errorf("failed to read content: %w", err)
+	}
+
+	start := len(s.pend)
+	s.pend = append(s.pend, emptyRecordHeader...)
+	out, err := s.encode(s.pend, plain)
+	if err != nil {
+		s.pend = s.pend[:start]
+		return -1, -1, fmt.Errorf("failed to encode content: %w", err)
+	}
+	s.pend = out
+	size := int64(len(out) - start - RecordHeaderSize)
+	binary.LittleEndian.PutUint64(s.pend[start:], uint64(size))
+
+	if cap(s.plain) > maxRetainedScratch {
+		s.plain = nil
+	}
+
+	if len(s.pend) >= pendingFlushSize {
+		if err := s.flush(); err != nil {
+			s.abandonTx()
+			return -1, -1, err
+		}
+	}
+
+	s.txPending = true
+	s.txIndex = index
+	s.txPendingCount++
+	s.currSize = index + size + RecordHeaderSize
+	return index, size, nil
+}
+
+// readInput reads all of r into the reusable plain buffer.
+func (s *storage) readInput(r io.Reader) ([]byte, error) {
+	buf := s.plain[:0]
+	if l, ok := r.(interface{ Len() int }); ok {
+		buf = slices.Grow(buf, l.Len()+1)
+	}
+	for {
+		if len(buf) == cap(buf) {
+			buf = slices.Grow(buf, max(512, cap(buf)))
+		}
+		n, err := r.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		if errors.Is(err, io.EOF) {
+			s.plain = buf
+			return buf, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 }
 
 // copyContent streams r to the log file. Sources that implement io.WriterTo
@@ -808,6 +881,8 @@ type options struct {
 	namespaces     []string
 	writeTransform Transformer
 	readTransform  Transformer
+	encode         Codec
+	decode         Codec
 }
 
 type OptionFunc func(*options) error
@@ -879,6 +954,21 @@ func WithReadTransform(t Transformer) OptionFunc {
 	}
 }
 
+// WithCodec sets whole-record codecs used instead of transformers, for
+// example for encryption or compression of small records. Records written
+// with encode must be read with the matching decode. It cannot be combined
+// with WithWriteTransform or WithReadTransform.
+func WithCodec(encode, decode Codec) OptionFunc {
+	return func(o *options) error {
+		if (encode == nil) != (decode == nil) {
+			return errors.New("both encode and decode codecs are required")
+		}
+		o.encode = encode
+		o.decode = decode
+		return nil
+	}
+}
+
 // ChainTransformers chains multiple transformers together.
 // Transformers are applied in order.
 func ChainTransformers(transformers ...Transformer) Transformer {
@@ -917,6 +1007,10 @@ func New(optFns ...OptionFunc) (*Storage, error) {
 
 	if o.readerCount <= 0 {
 		return nil, ErrReaderCountIsZero
+	}
+
+	if o.encode != nil && (o.writeTransform != nil || o.readTransform != nil) {
+		return nil, ErrCodecWithTransform
 	}
 
 	err := os.MkdirAll(o.logsDirPath, 0o755)
@@ -1016,6 +1110,8 @@ func newStorage(filepath string, o *options) (*storage, error) {
 		syncOnSave:     o.syncOnSave,
 		writeTransform: o.writeTransform,
 		readTransform:  o.readTransform,
+		encode:         o.encode,
+		decode:         o.decode,
 	}
 
 	st.r, err = os.Open(filepath)
@@ -1081,6 +1177,8 @@ type stream struct {
 	bufOff  int64
 	lastBig bool   // the previous record did not fit the window
 	scratch []byte // NextBytes buffer for records larger than the window
+	raw     []byte // encoded record when it does not fit the window
+	dec     []byte // decoded record
 
 	rd Reader // reused for every record
 }
@@ -1132,6 +1230,7 @@ func (s *stream) Next(ctx context.Context) (*Reader, int64, error) {
 	s.rd = Reader{
 		fd:            st.r,
 		recordOff:     s.index,
+		next:          s.index + RecordHeaderSize + size,
 		off:           s.index + RecordHeaderSize,
 		remaining:     size,
 		size:          size,
@@ -1144,6 +1243,12 @@ func (s *stream) Next(ctx context.Context) (*Reader, int64, error) {
 		s.rd.mem = rec[RecordHeaderSize:]
 	}
 	s.lastBig = rec == nil
+
+	if st.decode != nil {
+		if size, err = s.decodeRecord(size); err != nil {
+			return nil, -1, err
+		}
+	}
 
 	return &s.rd, size, nil
 }
@@ -1173,6 +1278,36 @@ func (s *stream) window(off, n, end, fill int64) ([]byte, error) {
 	}
 	s.buf, s.bufOff = b, off
 	return b[:n:n], nil
+}
+
+// decodeRecord replaces the reader's payload with the decoded record and
+// returns its size.
+func (s *stream) decodeRecord(size int64) (int64, error) {
+	raw := s.rd.mem
+	if raw == nil {
+		s.raw = slices.Grow(s.raw[:0], int(size))[:size]
+		if _, err := s.st.r.ReadAt(s.raw, s.rd.off); err != nil {
+			return -1, s.readErr(fmt.Errorf("failed to read record at %d: %w", s.index, err))
+		}
+		raw = s.raw
+		if cap(s.raw) > maxRetainedScratch {
+			s.raw = nil
+		}
+	}
+
+	dec, err := s.st.decode(s.dec[:0], raw)
+	if err != nil {
+		return -1, fmt.Errorf("failed to decode record at %d: %w", s.index, err)
+	}
+	if cap(dec) > maxRetainedScratch {
+		s.dec = nil
+	} else {
+		s.dec = dec
+	}
+
+	n := int64(len(dec))
+	s.rd.mem, s.rd.size, s.rd.remaining = dec, n, n
+	return n, nil
 }
 
 func (s *stream) releaseBuf() {
@@ -1259,6 +1394,7 @@ func (s *stream) Done() {
 // file with positional reads (pread).
 type Reader struct {
 	fd            *os.File
+	next          int64  // offset of the following record
 	mem           []byte // payload, when it was served from the read-ahead window
 	recordOff     int64
 	off           int64
@@ -1337,6 +1473,6 @@ func (r *Reader) Done() {
 		return
 	}
 	r.finished = true
-	r.stream.index = r.recordOff + RecordHeaderSize + r.size
+	r.stream.index = r.next
 	r.fd = nil
 }
