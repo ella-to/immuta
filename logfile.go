@@ -127,10 +127,10 @@ func loadFileHeader(fd *os.File) (total int64, index int64, err error) {
 
 // skipRecords walks n record headers starting at FileHeaderSize and returns
 // the offset just past the n-th record along with the offset of the n-th
-// record itself. Headers are read through a chunked pread cache so skipping
+// record itself. Every record must end at or before limit. Headers are read through a chunked pread cache so skipping
 // many small records costs one syscall per scanChunkSize window instead of
 // two syscalls per record.
-func skipRecords(fd *os.File, n int64) (end int64, last int64, err error) {
+func skipRecords(fd *os.File, n int64, limit int64) (end int64, last int64, err error) {
 	bufp := scanBufPool.Get().(*[]byte)
 	defer scanBufPool.Put(bufp)
 	buf := *bufp
@@ -152,6 +152,9 @@ func skipRecords(fd *os.File, n int64) (end int64, last int64, err error) {
 			chunkStart, chunkLen = off, int64(m)
 		}
 		size := int64(binary.LittleEndian.Uint64(buf[off-chunkStart:]))
+		if size < 0 || size > limit-off-RecordHeaderSize {
+			return -1, -1, fmt.Errorf("%w: record of %d bytes at offset %d exceeds %d", ErrCorrupted, size, off, limit)
+		}
 		last = off
 		off += RecordHeaderSize + size
 	}
@@ -189,7 +192,7 @@ func (s *storage) Verify(ctx context.Context) error {
 		return err
 	}
 
-	calculateSize, currIndex, err := skipRecords(fd, total)
+	calculateSize, currIndex, err := skipRecords(fd, total, size)
 	if err != nil {
 		return err
 	}
@@ -912,7 +915,7 @@ func (s *stream) Next(ctx context.Context) (*Reader, int64, error) {
 	}
 
 	if s.index == -1 {
-		index, _, err := skipRecords(s.st.r, s.skip)
+		index, _, err := skipRecords(s.st.r, s.skip, s.st.committedEnd.Load())
 		if err != nil {
 			return nil, -1, s.readErr(err)
 		}
@@ -929,6 +932,9 @@ func (s *stream) Next(ctx context.Context) (*Reader, int64, error) {
 		return nil, -1, s.readErr(fmt.Errorf("failed to read size of content at %d, id: %d: %w", s.index, s.id, err))
 	}
 	size := int64(binary.LittleEndian.Uint64(hdr[:]))
+	if size < 0 || size > s.st.committedEnd.Load()-s.index-RecordHeaderSize {
+		return nil, -1, fmt.Errorf("%w: record of %d bytes at offset %d exceeds the committed data", ErrCorrupted, size, s.index)
+	}
 
 	return &Reader{
 		fd:            s.st.r,

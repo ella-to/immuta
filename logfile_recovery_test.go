@@ -126,3 +126,38 @@ func TestReopenDetectsCorruptHeader(t *testing.T) {
 		t.Fatalf("expected ErrCorrupted, got %v", err)
 	}
 }
+
+// A record size that points past the committed data is reported, not trusted.
+func TestNextDetectsCorruptRecordSize(t *testing.T) {
+	t.Parallel()
+
+	namespace := "corruptsize"
+	path := "./TestNextDetectsCorruptRecordSize"
+	storage, cleanup := createStorage(t, path, namespace)
+	defer cleanup()
+
+	appendAndSave(t, storage, namespace, []byte("one"))
+	appendAndSave(t, storage, namespace, []byte("two"))
+
+	// corrupt the size of the first record in place
+	f, err := os.OpenFile(filepath.Join(path, namespace+".log"), os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(binary.LittleEndian.AppendUint64(nil, 1<<62), immuta.FileHeaderSize); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	for _, start := range []int64{0, 1} {
+		stream := storage.Stream(t.Context(), namespace, start)
+		_, _, err = stream.Next(t.Context())
+		stream.Done()
+		if !errors.Is(err, immuta.ErrCorrupted) {
+			t.Fatalf("start %d: expected ErrCorrupted, got %v", start, err)
+		}
+	}
+	if err := storage.Verify(t.Context(), namespace); !errors.Is(err, immuta.ErrCorrupted) {
+		t.Fatalf("verify: expected ErrCorrupted, got %v", err)
+	}
+}
