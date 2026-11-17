@@ -421,3 +421,58 @@ func TestAppendRejectsUnderReportedLen(t *testing.T) {
 		t.Fatalf("expected nothing committed, got %d records", n)
 	}
 }
+
+// Small (buffered) and streamed appends in one transaction keep their order,
+// and a rollback after an intermediate flush leaves nothing behind.
+func TestBufferedAppendsOrderAndRollback(t *testing.T) {
+	t.Parallel()
+
+	namespace := "buffered"
+	storage, cleanup := createStorage(t, "./TestBufferedAppendsOrderAndRollback", namespace)
+	defer cleanup()
+
+	large := bytes.Repeat([]byte("L"), 100*1024)
+	want := [][]byte{[]byte("s1"), large, []byte("s2"), []byte("unknown-size"), []byte("s3")}
+
+	var err error
+	for i, rec := range want {
+		var r io.Reader = bytes.NewReader(rec)
+		if i == 3 {
+			r = hideLen{r}
+		}
+		if _, _, err = storage.Append(t.Context(), namespace, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	storage.Save(namespace, &err)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// a transaction large enough to flush before Save, then rolled back
+	payload := bytes.Repeat([]byte("x"), 1000)
+	for range 3000 {
+		if _, _, err = storage.Append(t.Context(), namespace, bytes.NewReader(payload)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err = errors.New("abort")
+	storage.Save(namespace, &err)
+
+	appendAndSave(t, storage, namespace, []byte("after"))
+	want = append(want, []byte("after"))
+
+	stream := storage.Stream(t.Context(), namespace, 0)
+	defer stream.Done()
+	for i, w := range want {
+		if got := readNext(t, stream); !bytes.Equal(got, w) {
+			t.Fatalf("record %d mismatch: got %d bytes, want %d", i, len(got), len(w))
+		}
+	}
+	if n, _ := storage.Count(namespace); n != int64(len(want)) {
+		t.Fatalf("expected %d records, got %d", len(want), n)
+	}
+	if err := storage.Verify(t.Context(), namespace); err != nil {
+		t.Fatalf("verify failed: %v", err)
+	}
+}

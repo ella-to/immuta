@@ -30,6 +30,13 @@ const (
 	// records that do not fit the read-ahead window.
 	maxRetainedScratch = 1 << 20
 
+	// pendingFlushSize is the amount of buffered small records that triggers
+	// a write before Save.
+	pendingFlushSize = 1 << 20
+
+	// maxRetainedPending caps the pending buffer capacity kept between saves.
+	maxRetainedPending = 4 << 20
+
 	// scanChunkSize is the read-ahead window used when walking record headers
 	// (findIndex, Verify). One pread covers many small records.
 	scanChunkSize = 512 * 1024
@@ -122,8 +129,14 @@ type storage struct {
 	waitCh       chan struct{} // closed on the next commit; nil while no one waits
 	closedCh     chan struct{}
 
-	// wbuf stages small records (header + payload) so they are written with a
-	// single syscall. Append is single-writer, so no locking is needed.
+	// pend holds small records (header + payload) appended since the last
+	// flush. They are written with one syscall at Save, or once pend reaches
+	// pendingFlushSize. Readers never look past committedEnd, so unflushed
+	// records are invisible to them. Append is single-writer, so no locking
+	// is needed.
+	pend     []byte
+	diskSize int64 // bytes actually written to the file (currSize - len(pend))
+	// wbuf is the copy buffer for streamed (large or unknown-size) payloads
 	wbuf      []byte
 	currSize  int64
 	currCount int64
@@ -154,9 +167,9 @@ func loadFileHeader(fd *os.File) (total int64, index int64, err error) {
 
 // skipRecords walks n record headers starting at FileHeaderSize and returns
 // the offset just past the n-th record along with the offset of the n-th
-// record itself. Every record must end at or before limit. Headers are read through a chunked pread cache so skipping
-// many small records costs one syscall per scanChunkSize window instead of
-// two syscalls per record.
+// record itself. Every record must end at or before limit. Headers are read
+// through a chunked pread cache so skipping many small records costs one
+// syscall per scanChunkSize window instead of two syscalls per record.
 func skipRecords(fd *os.File, n int64, limit int64) (end int64, last int64, err error) {
 	bufp := scanBufPool.Get().(*[]byte)
 	defer scanBufPool.Put(bufp)
@@ -244,8 +257,11 @@ func (s *storage) Verify(ctx context.Context) error {
 // patches the file header with pwrite), so appends are purely sequential
 // writes with no seeks. If the source reader exposes its length via
 // Len() int (bytes.Reader, bytes.Buffer, strings.Reader, ...) and the
-// payload is small, the record header and payload are written with a single
-// syscall.
+// payload is small, the record is buffered in memory and every record of the
+// transaction is written with a single syscall when Save runs.
+//
+// If writing buffered records fails, every append of the pending
+// transaction is discarded and the error is returned.
 func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size int64, err error) {
 	if s.closed.Load() {
 		return -1, -1, ErrStorageClosed
@@ -272,29 +288,35 @@ func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 
 	switch {
 	case knownLen >= 0 && knownLen <= smallRecordThreshold:
-		// stage header + payload and write the whole record in one syscall
-		need := knownLen + RecordHeaderSize
-		if cap(s.wbuf) < need {
-			s.wbuf = make([]byte, smallRecordThreshold+RecordHeaderSize)
-		}
-		buf := s.wbuf[:need]
-		binary.LittleEndian.PutUint64(buf[:RecordHeaderSize], uint64(knownLen))
-		if _, err = io.ReadFull(contentReader, buf[RecordHeaderSize:]); err != nil {
-			// nothing has been written yet, the file is untouched
+		// buffer header + payload; written together with the rest of the
+		// transaction
+		start := len(s.pend)
+		s.pend = slices.Grow(s.pend, knownLen+RecordHeaderSize)[:start+knownLen+RecordHeaderSize]
+		binary.LittleEndian.PutUint64(s.pend[start:], uint64(knownLen))
+		if _, err = io.ReadFull(contentReader, s.pend[start+RecordHeaderSize:]); err != nil {
+			s.pend = s.pend[:start]
 			return -1, -1, fmt.Errorf("failed to read content: %w", err)
 		}
 		// Len() must be exact, otherwise the record would be silently cut
 		var probe [1]byte
 		if n, _ := contentReader.Read(probe[:]); n > 0 {
+			s.pend = s.pend[:start]
 			return -1, -1, fmt.Errorf("content is longer than its reported Len() of %d bytes", knownLen)
 		}
-		if _, err = s.w.Write(buf); err != nil {
-			s.discardPartialWrite(index)
-			return -1, -1, err
-		}
 		size = int64(knownLen)
+		if len(s.pend) >= pendingFlushSize {
+			if err = s.flush(); err != nil {
+				s.abandonTx()
+				return -1, -1, err
+			}
+		}
 
 	case knownLen > smallRecordThreshold:
+		// streamed payloads go straight to the file, after anything buffered
+		if err = s.flush(); err != nil {
+			s.abandonTx()
+			return -1, -1, err
+		}
 		// the size is known up front, so the real header can be written
 		// first and the payload streamed after it; no patching needed
 		var hdr [RecordHeaderSize]byte
@@ -311,8 +333,13 @@ func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 			s.discardPartialWrite(index)
 			return -1, -1, err
 		}
+		s.diskSize = index + size + RecordHeaderSize
 
 	default:
+		if err = s.flush(); err != nil {
+			s.abandonTx()
+			return -1, -1, err
+		}
 		// unknown size: write a placeholder header, stream the content, then
 		// patch the header in place with pwrite (does not move the fd offset)
 		if _, err = s.w.Write(emptyRecordHeader); err != nil {
@@ -330,6 +357,7 @@ func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 			s.discardPartialWrite(index)
 			return -1, -1, err
 		}
+		s.diskSize = index + size + RecordHeaderSize
 	}
 
 	// set pending transaction info; caller should call Save(&err) (deferred) to commit/rollback
@@ -384,6 +412,41 @@ func (s *storage) copyContent(r io.Reader) (written int64, err error) {
 func (s *storage) discardPartialWrite(offset int64) {
 	_ = s.w.Truncate(offset)
 	_, _ = s.w.Seek(offset, io.SeekStart)
+	s.diskSize = offset
+}
+
+// flush writes the buffered records to the file.
+func (s *storage) flush() error {
+	if len(s.pend) == 0 {
+		return nil
+	}
+	if _, err := s.w.Write(s.pend); err != nil {
+		s.discardPartialWrite(s.diskSize)
+		return fmt.Errorf("failed to write buffered records: %w", err)
+	}
+	s.diskSize += int64(len(s.pend))
+	s.resetPending()
+	return nil
+}
+
+func (s *storage) resetPending() {
+	if cap(s.pend) > maxRetainedPending {
+		s.pend = nil
+	} else {
+		s.pend = s.pend[:0]
+	}
+}
+
+// abandonTx discards every append of the pending transaction.
+func (s *storage) abandonTx() {
+	if s.txPending {
+		s.rollback(nil)
+	} else {
+		s.resetPending()
+		s.currSize = s.diskSize
+	}
+	s.txPending = false
+	s.txPendingCount = 0
 }
 
 // Close must not run concurrently with Append or Save: the caller has to stop
@@ -433,6 +496,11 @@ func (s *storage) Save(err *error) {
 	// If caller signaled an error, rollback by truncating the file to the base size
 	if err != nil && *err != nil {
 		s.rollback(err)
+		return
+	}
+
+	if flushErr := s.flush(); flushErr != nil {
+		s.abortCommit(err, flushErr)
 		return
 	}
 
@@ -526,6 +594,12 @@ func (s *storage) waitFor(ctx context.Context, off int64, done <-chan struct{}) 
 
 // rollback truncates uncommitted appends and restores in-memory state.
 func (s *storage) rollback(err *error) {
+	s.resetPending()
+	if s.diskSize == s.txBaseSize {
+		// nothing of the transaction reached the file
+		s.currSize = s.txBaseSize
+		return
+	}
 	if truncErr := s.w.Truncate(s.txBaseSize); truncErr != nil {
 		if err != nil {
 			*err = errors.Join(*err, fmt.Errorf("failed to truncate the file: %w", truncErr))
@@ -537,6 +611,7 @@ func (s *storage) rollback(err *error) {
 		}
 	}
 	s.currSize = s.txBaseSize
+	s.diskSize = s.txBaseSize
 }
 
 // abortCommit handles a failure inside the commit phase of Save: it restores
@@ -935,6 +1010,7 @@ func newStorage(filepath string, o *options) (*storage, error) {
 		w:              w,
 		closedCh:       make(chan struct{}),
 		currSize:       size,
+		diskSize:       size,
 		currCount:      count,
 		lastIndex:      lastIndex,
 		syncOnSave:     o.syncOnSave,
