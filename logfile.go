@@ -10,8 +10,6 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
-
-	"ella.to/solid"
 )
 
 const (
@@ -83,8 +81,20 @@ type storage struct {
 	// r is shared by every stream and reader. All reads are positional
 	// (pread), which is safe for concurrent use and never moves a shared
 	// file offset, so no pool of descriptors is needed.
-	r  *os.File
-	bc solid.Broadcast
+	r *os.File
+
+	// Committed state, published by Save and read by streams. committedEnd
+	// is the offset just past the last committed record: a stream may read
+	// any byte before it and must never read at or past it, since that data
+	// belongs to an open transaction which a rollback can truncate.
+	// Both values are stored under waitMu so a snapshot of the pair is
+	// consistent; committedEnd is also read lock-free on the hot path.
+	committedEnd atomic.Int64
+	committedCnt atomic.Int64
+	waitMu       sync.Mutex
+	waitCh       chan struct{} // closed on the next commit; nil while no one waits
+	closedCh     chan struct{}
+
 	// wbuf stages small records (header + payload) so they are written with a
 	// single syscall. Append is single-writer, so no locking is needed.
 	wbuf      []byte
@@ -158,7 +168,7 @@ func (s *storage) Details(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	return fmt.Sprintf("size: %d, count: %d", stat.Size(), s.currCount), nil
+	return fmt.Sprintf("size: %d, count: %d", stat.Size(), s.committedCnt.Load()), nil
 }
 
 func (s *storage) Verify(ctx context.Context) error {
@@ -354,8 +364,8 @@ func (s *storage) Close() error {
 		s.txPendingCount = 0
 	}
 
-	// Close the broadcast first to wake up all waiting streams
-	s.bc.Close()
+	// wake every waiting stream
+	close(s.closedCh)
 
 	// in-flight readers observe os.ErrClosed
 	var errs []error
@@ -421,8 +431,60 @@ func (s *storage) Save(err *error) {
 	s.lastIndex = s.txIndex
 	s.currCount = currCount
 
-	// notify waiting readers of the number of new messages
-	s.bc.Notify(s.txPendingCount)
+	s.publish(s.currSize, currCount)
+}
+
+// publish makes every record before end visible to streams and wakes the
+// ones waiting for new data. The writer stores the new end before taking
+// waitMu, and a waiting stream re-checks the end under waitMu before
+// parking, so a wake-up cannot be lost.
+func (s *storage) publish(end, count int64) {
+	s.waitMu.Lock()
+	s.committedCnt.Store(count)
+	s.committedEnd.Store(end)
+	ch := s.waitCh
+	s.waitCh = nil
+	s.waitMu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
+// snapshot returns a consistent (committed end, committed count) pair.
+func (s *storage) snapshot() (end, count int64) {
+	s.waitMu.Lock()
+	end, count = s.committedEnd.Load(), s.committedCnt.Load()
+	s.waitMu.Unlock()
+	return end, count
+}
+
+// waitFor blocks until a committed record exists at offset off.
+func (s *storage) waitFor(ctx context.Context, off int64, done <-chan struct{}) error {
+	for {
+		if off < s.committedEnd.Load() {
+			return nil
+		}
+		s.waitMu.Lock()
+		if off < s.committedEnd.Load() {
+			s.waitMu.Unlock()
+			return nil
+		}
+		if s.waitCh == nil {
+			s.waitCh = make(chan struct{})
+		}
+		ch := s.waitCh
+		s.waitMu.Unlock()
+
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.closedCh:
+			return ErrStorageClosed
+		case <-done:
+			return ErrStorageClosed
+		}
+	}
 }
 
 // rollback truncates uncommitted appends and restores in-memory state.
@@ -460,18 +522,28 @@ func (s *storage) abortCommit(err *error, cause error) {
 // Stream(ctx, 10) 	-> start after 10nth message
 //
 // NOTE: Creating a stream does not block the storage from writing new messages and it is concurrent safe.
+// The start position is resolved against the records committed when Stream
+// is called: a stream starting at the end sees exactly the records committed
+// after this call, however they are batched.
 func (s *storage) Stream(ctx context.Context, startPos int64) Stream {
-	return &stream{
-		id:       s.streamIdcount.Add(1),
-		index:    -1,
-		startPos: startPos,
-		st:       s,
-		signal:   s.bc.CreateSignal(solid.WithHistory(startPos)),
+	st := &stream{
+		id:     s.streamIdcount.Add(1),
+		index:  -1,
+		st:     s,
+		doneCh: make(chan struct{}),
 	}
-}
 
-func (s *storage) getLastIndex() int64 {
-	return s.lastIndex
+	end, count := s.snapshot()
+	switch {
+	case startPos < 0 || startPos >= count:
+		st.index = end
+	case startPos == 0:
+		st.index = FileHeaderSize
+	default:
+		// committed records never change, so the offset can be found lazily
+		st.skip = startPos
+	}
+	return st
 }
 
 type Storage struct {
@@ -764,7 +836,7 @@ func newStorage(filepath string, o *options) (*storage, error) {
 
 	st := &storage{
 		w:              w,
-		bc:             solid.NewBroadcastCond(solid.WithInitialTotal(count)),
+		closedCh:       make(chan struct{}),
 		currSize:       size,
 		currCount:      count,
 		lastIndex:      lastIndex,
@@ -778,6 +850,8 @@ func newStorage(filepath string, o *options) (*storage, error) {
 		w.Close()
 		return nil, err
 	}
+	st.committedEnd.Store(size)
+	st.committedCnt.Store(count)
 
 	return st, nil
 }
@@ -817,11 +891,13 @@ func getSize(w *os.File) (int64, error) {
 //
 
 type stream struct {
-	id       int64
-	index    int64
-	startPos int64
-	st       *storage
-	signal   solid.Signal
+	id    int64
+	index int64 // offset of the next record, -1 until resolved
+	skip  int64 // number of records to skip while index is -1
+	st    *storage
+
+	doneCh   chan struct{}
+	doneFlag atomic.Bool
 }
 
 func (s *stream) String() string {
@@ -830,87 +906,54 @@ func (s *stream) String() string {
 
 var _ Stream = (*stream)(nil)
 
-func (s *stream) findIndex(fd *os.File) (int64, error) {
-	total, _, err := loadFileHeader(fd)
-	if err != nil {
-		return -1, err
-	}
-
-	// if startPos is negative, start from the latest messages
-
-	if s.startPos < 0 || total-s.startPos <= 0 {
-		return s.st.getLastIndex(), nil
-	} else if s.startPos == 0 {
-		return FileHeaderSize, nil
-	}
-
-	index, _, err := skipRecords(fd, s.startPos)
-	return index, err
-}
-
 func (s *stream) Next(ctx context.Context) (*Reader, int64, error) {
-	for {
-		// Check if storage is closed before waiting
-		if s.st.closed.Load() {
-			return nil, -1, ErrStorageClosed
-		}
-
-		if s.signal == nil {
-			// the broadcast was already closed when this stream was created
-			return nil, -1, ErrStorageClosed
-		}
-
-		// Wait for signal WITHOUT holding an FD - this allows unlimited concurrent streams
-		err := s.signal.Wait(ctx)
-		if err != nil {
-			// Check if the error is because broadcast is closed
-			if errors.Is(err, solid.ErrSignalNotAvailable) {
-				return nil, -1, ErrStorageClosed
-			}
-			return nil, -1, err
-		}
-
-		// Check if storage is closed after waking up from wait
-		if s.st.closed.Load() {
-			return nil, -1, ErrStorageClosed
-		}
-
-		fd := s.st.r
-
-		// Initialize index on first read
-		if s.index == -1 {
-			s.index, err = s.findIndex(fd)
-			if err != nil {
-				return nil, -1, err
-			}
-		}
-
-		// Read the size of the next message with pread; no seek is needed and
-		// the fd's offset is never used, so reads cannot interfere
-		var hdr [RecordHeaderSize]byte
-		_, err = fd.ReadAt(hdr[:], s.index)
-		if errors.Is(err, io.EOF) {
-			// No data available yet, wait for the next signal
-			continue
-		} else if err != nil {
-			return nil, -1, fmt.Errorf("failed to read size of content at %d, id: %d: %w", s.index, s.id, err)
-		}
-		size := int64(binary.LittleEndian.Uint64(hdr[:]))
-
-		return &Reader{
-			fd:            fd,
-			off:           s.index + RecordHeaderSize,
-			remaining:     size,
-			size:          size,
-			stream:        s,
-			readTransform: s.st.readTransform,
-		}, size, nil
+	if s.st.closed.Load() || s.doneFlag.Load() {
+		return nil, -1, ErrStorageClosed
 	}
+
+	if s.index == -1 {
+		index, _, err := skipRecords(s.st.r, s.skip)
+		if err != nil {
+			return nil, -1, s.readErr(err)
+		}
+		s.index = index
+	}
+
+	if err := s.st.waitFor(ctx, s.index, s.doneCh); err != nil {
+		return nil, -1, err
+	}
+
+	// the record is committed, so its header is fully on disk
+	var hdr [RecordHeaderSize]byte
+	if _, err := s.st.r.ReadAt(hdr[:], s.index); err != nil {
+		return nil, -1, s.readErr(fmt.Errorf("failed to read size of content at %d, id: %d: %w", s.index, s.id, err))
+	}
+	size := int64(binary.LittleEndian.Uint64(hdr[:]))
+
+	return &Reader{
+		fd:            s.st.r,
+		off:           s.index + RecordHeaderSize,
+		remaining:     size,
+		size:          size,
+		stream:        s,
+		readTransform: s.st.readTransform,
+	}, size, nil
 }
 
+// readErr reports ErrStorageClosed for reads that failed because the storage
+// was closed underneath them.
+func (s *stream) readErr(err error) error {
+	if s.st.closed.Load() {
+		return ErrStorageClosed
+	}
+	return err
+}
+
+// Done releases the stream; a Next blocked in another goroutine returns
+// ErrStorageClosed.
 func (s *stream) Done() {
-	if s.signal != nil {
-		s.signal.Done()
+	if s.doneFlag.CompareAndSwap(false, true) {
+		close(s.doneCh)
 	}
 }
 
