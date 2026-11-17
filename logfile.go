@@ -135,7 +135,8 @@ type storage struct {
 	// records are invisible to them. Append is single-writer, so no locking
 	// is needed.
 	pend     []byte
-	diskSize int64 // bytes actually written to the file (currSize - len(pend))
+	diskSize int64   // bytes actually written to the file (currSize - len(pend))
+	probe    [1]byte // checks that a reader holds no more than its Len()
 	// wbuf is the copy buffer for streamed (large or unknown-size) payloads
 	wbuf      []byte
 	currSize  int64
@@ -298,8 +299,7 @@ func (s *storage) Append(ctx context.Context, r io.Reader) (index int64, size in
 			return -1, -1, fmt.Errorf("failed to read content: %w", err)
 		}
 		// Len() must be exact, otherwise the record would be silently cut
-		var probe [1]byte
-		if n, _ := contentReader.Read(probe[:]); n > 0 {
+		if n, _ := contentReader.Read(s.probe[:]); n > 0 {
 			s.pend = s.pend[:start]
 			return -1, -1, fmt.Errorf("content is longer than its reported Len() of %d bytes", knownLen)
 		}
