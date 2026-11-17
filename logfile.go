@@ -46,6 +46,7 @@ var (
 	ErrNamesapceNotFound = errors.New("namespace not found")
 	ErrStorageClosed     = errors.New("storage is closed")
 	ErrReaderCountIsZero = errors.New("reader count must be greater than zero")
+	ErrCorrupted         = errors.New("log file is corrupted")
 )
 
 // Transformer transforms a reader into another reader.
@@ -370,6 +371,13 @@ func (s *storage) Close() error {
 	// Check if already closed
 	if s.closed.Swap(true) {
 		return nil // Already closed
+	}
+
+	// Appends that were never saved must not survive in the file.
+	if s.txPending {
+		s.rollback(nil)
+		s.txPending = false
+		s.txPendingCount = 0
 	}
 
 	// Close the broadcast first to wake up all waiting streams
@@ -754,6 +762,22 @@ func newStorage(filepath string, o *options) (*storage, error) {
 		return nil, err
 	}
 
+	// Anything past the last committed record was appended but never
+	// published by Save (crash or Close mid-transaction). It must be dropped,
+	// otherwise readers would deliver it and new records would land after it.
+	end, err := committedEnd(w, size, count, lastIndex)
+	if err != nil {
+		w.Close()
+		return nil, fmt.Errorf("%s: %w", filepath, err)
+	}
+	if size > end {
+		if err = w.Truncate(end); err != nil {
+			w.Close()
+			return nil, fmt.Errorf("failed to drop uncommitted tail: %w", err)
+		}
+		size = end
+	}
+
 	// position the write cursor at the end of the file; Append and Save keep
 	// it there from now on (the header is patched with pwrite)
 	_, err = w.Seek(size, io.SeekStart)
@@ -789,6 +813,28 @@ func newStorage(filepath string, o *options) (*storage, error) {
 	}
 
 	return st, nil
+}
+
+// committedEnd returns the offset just past the last committed record, read
+// from the file header in O(1): the header stores the offset of the last
+// record, whose own header holds its size.
+func committedEnd(fd *os.File, fileSize, count, lastIndex int64) (int64, error) {
+	if count == 0 {
+		return FileHeaderSize, nil
+	}
+	if count < 0 || lastIndex < FileHeaderSize || lastIndex > fileSize-RecordHeaderSize {
+		return -1, fmt.Errorf("%w: header points at offset %d in a file of %d bytes", ErrCorrupted, lastIndex, fileSize)
+	}
+	var hdr [RecordHeaderSize]byte
+	if _, err := fd.ReadAt(hdr[:], lastIndex); err != nil {
+		return -1, err
+	}
+	size := int64(binary.LittleEndian.Uint64(hdr[:]))
+	end := lastIndex + RecordHeaderSize + size
+	if size < 0 || end < lastIndex || end > fileSize {
+		return -1, fmt.Errorf("%w: last record of %d bytes at offset %d exceeds file size %d", ErrCorrupted, size, lastIndex, fileSize)
+	}
+	return end, nil
 }
 
 func getSize(w *os.File) (int64, error) {
