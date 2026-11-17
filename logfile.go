@@ -21,6 +21,15 @@ const (
 	// written together with its record header in a single write syscall.
 	smallRecordThreshold = 64 * 1024
 
+	// readAheadSize is the window a stream reads ahead of its position, so
+	// consecutive small records cost one pread per window instead of two
+	// per record.
+	readAheadSize = 64 * 1024
+
+	// maxRetainedScratch caps the per-stream buffer NextBytes keeps for
+	// records that do not fit the read-ahead window.
+	maxRetainedScratch = 1 << 20
+
 	// scanChunkSize is the read-ahead window used when walking record headers
 	// (findIndex, Verify). One pread covers many small records.
 	scanChunkSize = 512 * 1024
@@ -33,6 +42,13 @@ var (
 
 // scanBufPool recycles the read-ahead windows used by skipRecords, so
 // creating a stream at a deep start position does not allocate every time.
+var readAheadPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, readAheadSize)
+		return &b
+	},
+}
+
 var scanBufPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, scanChunkSize)
@@ -68,7 +84,16 @@ type Appender interface {
 type Stream interface {
 	// Creates a io.Reader and provide the size of the content ahead of time.
 	// If there is no more content to read, it will blocked until there is more content or the context is done.
+	//
+	// The returned Reader is owned by the stream and reused by the next call,
+	// so call Reader.Done before calling Next again.
 	Next(ctx context.Context) (r *Reader, size int64, err error)
+	// NextBytes is like Next followed by reading the whole record and Done.
+	// The returned slice is only valid until the next call on the stream.
+	// off is the byte offset of the record (see Storage.StreamAt).
+	NextBytes(ctx context.Context) (data []byte, off int64, err error)
+	// Ready reports whether Next can return a record without waiting.
+	Ready() bool
 	// Done should be called to release the reader.
 	// the best practice is once an stream is created successfully, call Done in defer.
 	Done()
@@ -677,8 +702,10 @@ func (s *Storage) Namespaces() []string {
 // errStream is returned for streams that could not be created.
 type errStream struct{ err error }
 
-func (e errStream) Next(context.Context) (*Reader, int64, error) { return nil, -1, e.err }
-func (e errStream) Done()                                        {}
+func (e errStream) Next(context.Context) (*Reader, int64, error)     { return nil, -1, e.err }
+func (e errStream) NextBytes(context.Context) ([]byte, int64, error) { return nil, -1, e.err }
+func (e errStream) Ready() bool                                      { return false }
+func (e errStream) Done()                                            {}
 
 func (s *Storage) Details(ctx context.Context, namespace string) (string, error) {
 	st, err := s.getStorageByNamespace(namespace)
@@ -968,6 +995,18 @@ type stream struct {
 
 	doneCh   chan struct{}
 	doneFlag atomic.Bool
+
+	// Read-ahead window: buf holds the bytes of the file starting at bufOff.
+	// It never extends past the committed end, and the backing array goes
+	// back to the pool whenever the stream has to wait for new data, so idle
+	// streams hold no buffer.
+	bufp    *[]byte
+	buf     []byte
+	bufOff  int64
+	lastBig bool   // the previous record did not fit the window
+	scratch []byte // NextBytes buffer for records larger than the window
+
+	rd Reader // reused for every record
 }
 
 func (s *stream) String() string {
@@ -981,37 +1020,142 @@ func (s *stream) Next(ctx context.Context) (*Reader, int64, error) {
 		return nil, -1, ErrStorageClosed
 	}
 
+	st := s.st
 	if s.index == -1 {
-		index, _, err := skipRecords(s.st.r, s.skip, s.st.committedEnd.Load())
+		index, _, err := skipRecords(st.r, s.skip, st.committedEnd.Load())
 		if err != nil {
 			return nil, -1, s.readErr(err)
 		}
 		s.index = index
 	}
 
-	if err := s.st.waitFor(ctx, s.index, s.doneCh); err != nil {
-		return nil, -1, err
+	if s.index >= st.committedEnd.Load() {
+		s.releaseBuf()
+		if err := st.waitFor(ctx, s.index, s.doneCh); err != nil {
+			return nil, -1, err
+		}
 	}
+	end := st.committedEnd.Load()
 
 	// the record is committed, so its header is fully on disk
-	var hdr [RecordHeaderSize]byte
-	if _, err := s.st.r.ReadAt(hdr[:], s.index); err != nil {
+	// after a record too large for the window, read only the next header so
+	// runs of large records are not read twice
+	fill := int64(readAheadSize)
+	if s.lastBig {
+		fill = RecordHeaderSize
+	}
+	hdr, err := s.window(s.index, RecordHeaderSize, end, fill)
+	if err != nil {
 		return nil, -1, s.readErr(fmt.Errorf("failed to read size of content at %d, id: %d: %w", s.index, s.id, err))
 	}
-	size := int64(binary.LittleEndian.Uint64(hdr[:]))
-	if size < 0 || size > s.st.committedEnd.Load()-s.index-RecordHeaderSize {
+	size := int64(binary.LittleEndian.Uint64(hdr))
+	if size < 0 || size > end-s.index-RecordHeaderSize {
 		return nil, -1, fmt.Errorf("%w: record of %d bytes at offset %d exceeds the committed data", ErrCorrupted, size, s.index)
 	}
 
-	return &Reader{
-		fd:            s.st.r,
+	s.rd = Reader{
+		fd:            st.r,
 		recordOff:     s.index,
 		off:           s.index + RecordHeaderSize,
 		remaining:     size,
 		size:          size,
 		stream:        s,
-		readTransform: s.st.readTransform,
-	}, size, nil
+		readTransform: st.readTransform,
+	}
+	// serve the payload from memory when the whole record fits the window
+	rec, err := s.window(s.index, RecordHeaderSize+size, end, readAheadSize)
+	if err == nil && rec != nil {
+		s.rd.mem = rec[RecordHeaderSize:]
+	}
+	s.lastBig = rec == nil
+
+	return &s.rd, size, nil
+}
+
+// window returns the n bytes at off from the read-ahead buffer, refilling it
+// with a single pread of up to fill bytes when needed. It returns nil when n
+// exceeds the window.
+func (s *stream) window(off, n, end, fill int64) ([]byte, error) {
+	if s.buf != nil && off >= s.bufOff && off+n <= s.bufOff+int64(len(s.buf)) {
+		start := off - s.bufOff
+		return s.buf[start : start+n : start+n], nil
+	}
+	if n > readAheadSize {
+		return nil, nil
+	}
+	if s.bufp == nil {
+		s.bufp = readAheadPool.Get().(*[]byte)
+	}
+	b := (*s.bufp)[:min(max(fill, n), end-off)]
+	m, err := s.st.r.ReadAt(b, off)
+	if m < len(b) {
+		s.buf = nil
+		if err == nil || errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, err
+	}
+	s.buf, s.bufOff = b, off
+	return b[:n:n], nil
+}
+
+func (s *stream) releaseBuf() {
+	if s.bufp != nil {
+		readAheadPool.Put(s.bufp)
+		s.bufp, s.buf = nil, nil
+	}
+}
+
+func (s *stream) NextBytes(ctx context.Context) ([]byte, int64, error) {
+	r, size, err := s.Next(ctx)
+	if err != nil {
+		return nil, -1, err
+	}
+
+	if r.readTransform == nil && r.mem != nil {
+		r.Done()
+		return r.mem, r.recordOff, nil
+	}
+
+	buf := s.scratch[:0]
+	if r.readTransform == nil {
+		buf = slices.Grow(buf, int(size))[:size]
+		if _, err = io.ReadFull(r, buf); err != nil {
+			return nil, -1, s.readErr(err)
+		}
+	} else {
+		for {
+			if len(buf) == cap(buf) {
+				buf = slices.Grow(buf, max(512, cap(buf)))
+			}
+			n, rerr := r.Read(buf[len(buf):cap(buf)])
+			buf = buf[:len(buf)+n]
+			if errors.Is(rerr, io.EOF) {
+				break
+			}
+			if rerr != nil {
+				return nil, -1, s.readErr(rerr)
+			}
+		}
+	}
+
+	if cap(buf) <= maxRetainedScratch {
+		s.scratch = buf
+	} else {
+		s.scratch = nil
+	}
+	r.Done()
+	return buf, r.recordOff, nil
+}
+
+func (s *stream) Ready() bool {
+	if s.st.closed.Load() || s.doneFlag.Load() {
+		return false
+	}
+	if s.index == -1 {
+		return s.st.committedCnt.Load() > s.skip
+	}
+	return s.index < s.st.committedEnd.Load()
 }
 
 // readErr reports ErrStorageClosed for reads that failed because the storage
@@ -1039,6 +1183,7 @@ func (s *stream) Done() {
 // file with positional reads (pread).
 type Reader struct {
 	fd            *os.File
+	mem           []byte // payload, when it was served from the read-ahead window
 	recordOff     int64
 	off           int64
 	remaining     int64
@@ -1063,6 +1208,11 @@ func (r *rawReader) Read(p []byte) (int, error) {
 func (r *Reader) readRaw(p []byte) (int, error) {
 	if r.remaining <= 0 {
 		return 0, io.EOF
+	}
+	if r.mem != nil {
+		n := copy(p, r.mem[r.size-r.remaining:])
+		r.remaining -= int64(n)
+		return n, nil
 	}
 	if int64(len(p)) > r.remaining {
 		p = p[:r.remaining]
@@ -1111,6 +1261,6 @@ func (r *Reader) Done() {
 		return
 	}
 	r.finished = true
-	r.stream.index += r.size + RecordHeaderSize
+	r.stream.index = r.recordOff + RecordHeaderSize + r.size
 	r.fd = nil
 }

@@ -233,3 +233,45 @@ func TestStreamUnknownNamespace(t *testing.T) {
 		t.Fatalf("expected ErrNamesapceNotFound, got %v", err)
 	}
 }
+
+// Records of mixed sizes, including ones larger than the read-ahead window
+// and ones straddling its boundary, read back intact through every API.
+func TestStreamMixedSizesAcrossReadAhead(t *testing.T) {
+	t.Parallel()
+
+	namespace := "mixed"
+	storage, cleanup := createStorage(t, "./TestStreamMixedSizesAcrossReadAhead", namespace)
+	defer cleanup()
+
+	sizes := []int{0, 1, 100, 64*1024 - 8, 64 * 1024, 64*1024 + 1, 3, 200 * 1024, 7, 40 * 1024, 40 * 1024}
+	var records [][]byte
+	for i, n := range sizes {
+		rec := bytes.Repeat([]byte{byte('a' + i)}, n)
+		records = append(records, rec)
+		appendAndSave(t, storage, namespace, rec)
+	}
+
+	viaReader := storage.Stream(t.Context(), namespace, 0)
+	defer viaReader.Done()
+	viaBytes := storage.Stream(t.Context(), namespace, 0)
+	defer viaBytes.Done()
+
+	for i, want := range records {
+		if got := readNext(t, viaReader); !bytes.Equal(got, want) {
+			t.Fatalf("reader: record %d mismatch (len %d vs %d)", i, len(got), len(want))
+		}
+		if !viaBytes.Ready() {
+			t.Fatalf("bytes: stream should be ready before record %d", i)
+		}
+		got, _, err := viaBytes.NextBytes(t.Context())
+		if err != nil {
+			t.Fatalf("bytes: record %d: %v", i, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("bytes: record %d mismatch (len %d vs %d)", i, len(got), len(want))
+		}
+	}
+	if viaBytes.Ready() {
+		t.Fatal("stream should not be ready at the end of the log")
+	}
+}
